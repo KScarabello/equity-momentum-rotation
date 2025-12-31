@@ -1,0 +1,99 @@
+# ============================================================
+# Alpha v1 — Equity Momentum Rotation
+# ------------------------------------------------------------
+# This file defines the full, locked strategy configuration.
+# Code must read from this file and NEVER modify it.
+# Any change here constitutes a new version.
+# ============================================================
+
+strategy:
+  name: "Alpha v1 - Equity Momentum Rotation"
+  version: "1.0"
+  description: >
+    Systematic equity momentum rotation strategy.
+    Selects the top-ranked large-cap U.S. equities
+    using 12–1 momentum, rebalanced biweekly,
+    with volatility targeting and capped leverage.
+
+# ------------------------------------------------------------
+# Universe Definition
+# ------------------------------------------------------------
+universe:
+  type: "equities"
+  region: "US"
+  universe_source: "sp500"
+  max_universe_size: 150
+
+  filters:
+    min_average_daily_dollar_volume: 10000000 # liquidity filter
+    min_price: 5.0 # avoid penny stocks
+
+# ------------------------------------------------------------
+# Signal Definition
+# ------------------------------------------------------------
+signal:
+  type: "momentum"
+
+  momentum:
+    lookback_months: 12
+    skip_recent_months: 1
+    return_type: "total"
+    ranking: "descending"
+    absolute_momentum_filter:
+      enabled: true
+      min_momentum: 1.0
+      risk_off_asset: "CASH"
+
+# ------------------------------------------------------------
+# Portfolio Construction
+# ------------------------------------------------------------
+portfolio:
+  selection_method: "top_n"
+  top_n: 10
+
+  weighting:
+    method: "equal"
+
+  constraints:
+    max_position_weight: 0.15 # prevents accidental concentration
+
+# ------------------------------------------------------------
+# Rebalancing Rules
+# ------------------------------------------------------------
+rebalance:
+  frequency: "biweekly"
+  trading_days_interval: 10 # approximate biweekly cadence
+  rebalance_on_close: true
+
+# ------------------------------------------------------------
+# Risk Management & Leverage
+# ------------------------------------------------------------
+risk:
+  volatility_target:
+    enabled: true
+    target_annual_volatility: 0.15
+    vol_lookback_days: 40
+
+  leverage:
+    enabled: true
+    max_leverage: 1.5
+
+  drawdown_control:
+    enabled: true
+    max_drawdown: 0.20
+    action_on_breach: "de_risk_to_cash"
+
+# ------------------------------------------------------------
+# Execution Assumptions (for backtesting & realism)
+# ------------------------------------------------------------
+execution:
+  slippage_bps: 5
+  commission_bps: 1
+  allow_partial_fills: false
+
+# ------------------------------------------------------------
+# Operational Safeguards
+# ------------------------------------------------------------
+safeguards:
+  trade_only_on_rebalance_day: true
+  fail_safe_action: "hold_cash"
