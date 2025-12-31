@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+
+# Data
+data/
+*.csv
+*.parquet
+
+# Logs
+logs/
+
+# OS
+.DS_Store
