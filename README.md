@@ -35,3 +35,61 @@ Any unintended logic change will fail tests.
 ## Disclaimer
 
 This is a research project, not investment advice.
+
+## Data Setup (Required)
+
+This project expects historical equity price data in **Stooq parquet format**.
+The data directory is intentionally **not committed to git**.
+
+Each parquet file should contain daily OHLCV data for a single symbol and
+be indexed by date.
+
+---
+
+### How to Obtain the Data
+
+You can download historical U.S. equity data from **Stooq**:
+
+- Stooq database: https://stooq.com/db/h/
+
+Download the daily U.S. equities dataset and extract the CSV files you want
+to use (e.g. large-cap U.S. stocks).
+
+---
+
+### Convert CSV Files to Parquet
+
+Below is an example script to convert Stooq CSV files into the expected
+parquet format.
+
+```python
+import pandas as pd
+from pathlib import Path
+
+csv_dir = Path("stooq_csv")          # directory containing downloaded CSVs
+out_dir = Path("data_cache/stooq")   # expected by this project
+out_dir.mkdir(parents=True, exist_ok=True)
+
+for csv in csv_dir.glob("*.csv"):
+    df = pd.read_csv(csv)
+
+    # Normalize date column
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.set_index("Date")
+
+    df = df.sort_index()
+
+    # Save as parquet
+    out_path = out_dir / f"{csv.stem}.parquet"
+    df.to_parquet(out_path)
+
+    print(f"Wrote {out_path}")
+
+### Verify Data Load
+
+Once the parquet files are in place, run:
+
+
+python -m research.run_backtest.py
+```
