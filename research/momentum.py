@@ -22,6 +22,10 @@ def compute_12_1_momentum(
     min_price: float = 5.0,
 ) -> pd.Series:
     """
+    12-1 momentum:
+      end = price at (t - skip_recent_months)
+      start = price at (t - skip_recent_months - lookback_months)
+
     prices: DataFrame indexed by date, columns = tickers, values = prices
     returns: Series indexed by ticker, momentum score
     """
@@ -30,13 +34,17 @@ def compute_12_1_momentum(
     lookback_days = trading_days_from_months(lookback_months)
     skip_days = trading_days_from_months(skip_recent_months)
 
-    if len(prices) < lookback_days + skip_days:
+    required = lookback_days + skip_days + 1
+    if len(prices) < required:
         raise ValueError("Not enough data to compute momentum")
 
+    # End is at t - skip_days
     end_prices = prices.iloc[-1 - skip_days]
-    start_prices = prices.iloc[-1 - lookback_days]
 
-    # Liquidity / sanity filter
+    # Start is at t - skip_days - lookback_days
+    start_prices = prices.iloc[-1 - skip_days - lookback_days]
+
+    # Liquidity / sanity filter using latest available close (today)
     tradable = prices.iloc[-1] >= min_price
     end_prices = end_prices[tradable]
     start_prices = start_prices[tradable]
@@ -100,20 +108,18 @@ if __name__ == "__main__":
     abs_filter = cfg["signal"]["momentum"].get("absolute_momentum_filter", {})
     abs_enabled = bool(abs_filter.get("enabled", False))
     min_mom = float(abs_filter.get("min_momentum", 0.0))
-    n = cfg["portfolio"]["top_n"]
-    min_price = cfg["universe"]["filters"]["min_price"]
+    n = int(cfg["portfolio"]["top_n"])
+    min_price = float(cfg["universe"]["filters"]["min_price"])
 
-scores = compute_12_1_momentum(prices, min_price=min_price)
+    scores = compute_12_1_momentum(prices, min_price=min_price)
 
-top_n = int(cfg["portfolio"]["top_n"])
-top = pick_top_n(scores, top_n)
-top = apply_absolute_momentum_filter(scores, top, abs_enabled, min_mom)
+    top = pick_top_n(scores, n)
+    top = apply_absolute_momentum_filter(scores, top, abs_enabled, min_mom)
 
-
-if len(top) == 0:
-    print("RISK-OFF TRIGGERED: best momentum < min_momentum")
-    print("Holding CASH (no equity positions)")
-else:
-    print("Top picks:", top)
-    print("Scores:")
-    print(scores.loc[top])
+    if len(top) == 0:
+        print("RISK-OFF TRIGGERED: best momentum < min_momentum")
+        print("Holding CASH (no equity positions)")
+    else:
+        print("Top picks:", top)
+        print("Scores:")
+        print(scores.loc[top])

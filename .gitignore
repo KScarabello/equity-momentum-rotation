@@ -8,8 +8,7 @@ __pycache__/
 venv/
 
 # Data
-data/
-*.csv
+data_cache/
 *.parquet
 
 # Logs
