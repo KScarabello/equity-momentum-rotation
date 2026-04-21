@@ -3,6 +3,12 @@ from __future__ import annotations
 import pandas as pd
 
 from research.data_stooq import load_stooq_price_matrix
+from research.locked_experiment import (
+    LOCKED_START_DATE,
+    LOCKED_END_DATE,
+    LOCKED_SYMBOLS,
+    MIN_SYMBOL_COUNT,
+)
 from research.backtest_v0 import backtest_rotation_v0
 
 
@@ -33,31 +39,55 @@ def _compute_metrics_from_prices(price_series: pd.Series) -> dict:
 
 
 def main() -> None:
+    from research.locked_experiment import (
+        LOCKED_START_DATE,
+        LOCKED_END_DATE,
+        LOCKED_SYMBOLS,
+        MIN_SYMBOL_COUNT,
+    )
+
     prices_all = load_stooq_price_matrix(
         stooq_dir="data_cache/stooq",
-        # limit_symbols=150,
-        # start="2015-01-01",
-        # end="2025-12-31",
+        start=LOCKED_START_DATE,
+        end=LOCKED_END_DATE,
     )
 
     prices_all = prices_all.sort_index().ffill(limit=3)
 
-    if "SPY" not in prices_all.columns:
-        raise ValueError(
-            "SPY not found in loaded matrix. Expected a file like SPY.US.parquet so symbol becomes 'SPY'."
-        )
+    # --- Enforce locked universe ---
+    present = set(prices_all.columns)
+    required = LOCKED_SYMBOLS
+    missing = required - present
 
+    if missing:
+        raise RuntimeError(f"Missing required symbols: {sorted(missing)}")
+
+    prices_all = prices_all[list(required)].copy()
+
+    if prices_all.shape[1] < MIN_SYMBOL_COUNT:
+        raise RuntimeError("Too few symbols after universe lock")
+
+    # --- Separate SPY for benchmark ---
     spy = prices_all["SPY"].copy()
-    prices = prices_all.drop(columns=["SPY"], errors="ignore")
+    prices = prices_all.drop(columns=["SPY"])
 
-    print("Loaded prices (ex SPY):", prices.shape)
-    print("Date range:", prices.index.min().date(), "->", prices.index.max().date())
+    print("Locked universe size (ex SPY):", prices.shape[1])
+    print(
+        "Locked date range:",
+        prices.index.min().date(),
+        "->",
+        prices.index.max().date(),
+    )
 
-    # Strategy
-    out = backtest_rotation_v0(prices, config_path="config/alpha_v1.yaml", cost_bps=10)
+    # --- Strategy backtest ---
+    out = backtest_rotation_v0(
+        prices,
+        config_path="config/alpha_v1.yaml",
+        cost_bps=10,
+    )
     m = out["metrics"]
 
-    # Benchmark (align to strategy date index)
+    # --- Benchmark (align to strategy dates) ---
     spy_aligned = spy.reindex(out["equity_curve"].index).ffill()
     spy_metrics = _compute_metrics_from_prices(spy_aligned)
 

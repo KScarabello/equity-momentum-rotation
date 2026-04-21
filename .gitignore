@@ -3,7 +3,11 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
+.ipynb_checkpoints/
 .env
+.env.*
+!.env.example
 .venv/
 venv/
 
@@ -13,6 +17,26 @@ data_cache/
 
 # Logs
 logs/
+*.log
+
+# Generated research outputs
+comparison_strategy_vs_spy*.csv
+engine_reconciliation.csv
+engine_reconciliation_summary.txt
+window_boundary_reconciliation.csv
+window_boundary_reconciliation_summary.txt
+walk_forward_equity_oos.csv
+walk_forward_windows.csv
+live_sim_*.csv
+live_sim_*.json
+research/*_results.csv
+research/*_summary.csv
+research/*_diagnostics.csv
+research/*_worst_window.csv
+research/*_values.csv
+research/*_frequency.csv
+research/*_check.csv
+archive/legacy_outputs/
 
 # OS
 .DS_Store

@@ -21,8 +21,7 @@ def list_stooq_parquets(
 
 
 def _infer_symbol_from_filename(p: Path) -> str:
-    # e.g. AAPL.US.parquet -> AAPL
-    name = p.stem  # AAPL.US
+    name = p.stem
     return name.split(".")[0] if "." in name else name
 
 
@@ -33,14 +32,8 @@ def load_stooq_price_matrix(
     start: Optional[str] = None,
     end: Optional[str] = None,
 ) -> pd.DataFrame:
-    """
-    Loads per-symbol Stooq parquet files and returns:
-      index = datetime
-      columns = symbols
-      values = price series (prefers close-like field)
-    """
+    """Load close-like price series from per-symbol Stooq parquet files."""
     if field_preference is None:
-        # Stooq parquet you showed: Open/High/Low/Close/Volume (no adj close)
         field_preference = ["Adj Close", "AdjClose", "adj_close", "close", "Close"]
 
     files = list_stooq_parquets(stooq_dir, limit=limit_symbols)
@@ -49,7 +42,6 @@ def load_stooq_price_matrix(
     for fp in files:
         df = pd.read_parquet(fp)
 
-        # Normalize date index
         if "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"])
             df = df.set_index("date")

@@ -59,37 +59,48 @@ to use (e.g. large-cap U.S. stocks).
 
 ### Convert CSV Files to Parquet
 
-Below is an example script to convert Stooq CSV files into the expected
-parquet format.
+Example conversion script:
 
 ```python
 import pandas as pd
 from pathlib import Path
 
-csv_dir = Path("stooq_csv")          # directory containing downloaded CSVs
-out_dir = Path("data_cache/stooq")   # expected by this project
+csv_dir = Path("stooq_csv")
+out_dir = Path("data_cache/stooq")
 out_dir.mkdir(parents=True, exist_ok=True)
 
 for csv in csv_dir.glob("*.csv"):
     df = pd.read_csv(csv)
 
-    # Normalize date column
     if "Date" in df.columns:
         df["Date"] = pd.to_datetime(df["Date"])
         df = df.set_index("Date")
 
     df = df.sort_index()
 
-    # Save as parquet
     out_path = out_dir / f"{csv.stem}.parquet"
     df.to_parquet(out_path)
 
     print(f"Wrote {out_path}")
+```
 
 ### Verify Data Load
 
-Once the parquet files are in place, run:
+Run:
 
-
-python -m research.run_backtest.py
+```bash
+python -m research.run_backtest
 ```
+
+## Intentionally Excluded From Git
+
+The following are intentionally local-only and should not be committed:
+
+- Market data cache in `data_cache/`
+- Local secrets such as `.env`
+- Runtime logs in `logs/`
+- Generated research outputs (CSV/JSON/TXT summaries)
+- Machine-local caches such as `.pytest_cache/` and notebook checkpoints
+
+Generated outputs can be retained locally for analysis, but should be treated as
+artifacts rather than source code.
