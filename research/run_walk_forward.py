@@ -18,7 +18,7 @@ STOOQ_DIR = Path("data_cache/stooq")
 
 
 def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-        """Normalize index/columns and require close/volume fields."""
+    """Normalize index/columns and require close/volume fields."""
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"])
         df = df.set_index("date")

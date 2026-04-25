@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Production-safe Alpaca live runner for the validated baseline momentum strategy.
+Production-safe Alpaca live runner for the validated momentum strategy.
 
 Run:
     python3 -m live.run_alpaca_live_trader --dry-run --verbose
@@ -10,21 +10,29 @@ Run:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List
 from zoneinfo import ZoneInfo
 
-import numpy as np
 import pandas as pd
 
-from config.live_trading_config import LiveTradingConfig, build_baseline_cfg
+from config.live_trading_config import LiveTradingConfig, build_baseline_cfg, load_live_trading_config
 from live.alpaca_client import AlpacaBroker, AlpacaCredentials, AlpacaDependencyError
+from live.execution_gate import (
+    filter_symbols_already_pending,
+    validate_account_for_trading,
+    validate_assets_for_orders,
+    validate_order_plan_shape,
+    within_execution_window,
+)
+from live.rebalance_planner import PlannedOrder, build_rebalance_plan, positions_from_alpaca
 from live.state_store import load_state, save_state
 from research.run_walk_forward import STOOQ_DIR, build_universe_from_stooq, fetch_ohlcv
 from research.walk_forward_momentum import (
@@ -37,8 +45,8 @@ from research.walk_forward_momentum import (
 
 ET = ZoneInfo("America/New_York")
 
+
 def _load_local_env(env_path: Path = Path(".env")) -> None:
-    """Load .env values into process environment without overriding existing vars."""
     try:
         from dotenv import load_dotenv as _load_dotenv  # type: ignore
 
@@ -64,21 +72,19 @@ def _load_local_env(env_path: Path = Path(".env")) -> None:
 _load_local_env(Path(".env"))
 
 
-@dataclass
+@dataclass(frozen=True)
 class RuntimeContext:
     run_id: str
-    logger: logging.Logger
-    config: LiveTradingConfig
     dry_run: bool
     force: bool
     verbose: bool
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run Alpaca live trader for baseline momentum strategy")
-    p.add_argument("--dry-run", action="store_true", help="Compute targets/orders but do not place orders")
-    p.add_argument("--live", action="store_true", help="Enable live order placement (must be explicit)")
-    p.add_argument("--force", action="store_true", help="Bypass preferred execution window guardrail")
+    p = argparse.ArgumentParser(description="Run one Alpaca live rebalance cycle")
+    p.add_argument("--dry-run", action="store_true", help="Compute and log only; do not place orders")
+    p.add_argument("--live", action="store_true", help="Enable live order placement")
+    p.add_argument("--force", action="store_true", help="Bypass execution window and duplicate-cycle checks")
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
     return p.parse_args()
 
@@ -103,28 +109,13 @@ def _setup_logging(cfg: LiveTradingConfig, run_id: str, verbose: bool) -> loggin
     sh.setLevel(logging.DEBUG if verbose else logging.INFO)
     logger.addHandler(sh)
 
-    logger.info("Logging to %s", log_fp)
+    logger.info("logging_path=%s", log_fp)
     return logger
 
 
-def _load_creds_from_env() -> AlpacaCredentials:
-    api_key = os.getenv("ALPACA_API_KEY", "").strip()
-    secret_key = os.getenv("ALPACA_SECRET_KEY", "").strip()
-    base_url = os.getenv("ALPACA_BASE_URL", "").strip()
-
-    missing = [
-        name
-        for name, value in [
-            ("ALPACA_API_KEY", api_key),
-            ("ALPACA_SECRET_KEY", secret_key),
-            ("ALPACA_BASE_URL", base_url),
-        ]
-        if not value
-    ]
-    if missing:
-        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
-
-    return AlpacaCredentials(api_key=api_key, secret_key=secret_key, base_url=base_url)
+def _log_event(logger: logging.Logger, event: str, **fields: Any) -> None:
+    payload = {"event": event, **fields}
+    logger.info("%s", json.dumps(payload, default=str, sort_keys=True))
 
 
 def _to_float(value: Any, fallback: float = 0.0) -> float:
@@ -132,41 +123,6 @@ def _to_float(value: Any, fallback: float = 0.0) -> float:
         return float(value)
     except Exception:
         return fallback
-
-
-def _within_execution_window(now_et: datetime, cfg: LiveTradingConfig) -> bool:
-    t = now_et.time()
-    return cfg.execution_window_start <= t <= cfg.execution_window_end
-
-
-def _load_strategy_data(logger: logging.Logger) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
-    logger.info("Loading strategy inputs from cache")
-    symbols = build_universe_from_stooq(STOOQ_DIR)
-    logger.info("Universe loaded from cache: %d symbols", len(symbols))
-
-    market_df = fetch_ohlcv("SPY")
-    market_df = _ensure_datetime_index(_normalize_cols(market_df))
-
-    symbol_dfs: dict[str, pd.DataFrame] = {}
-    for sym in symbols:
-        try:
-            symbol_dfs[sym] = _ensure_datetime_index(_normalize_cols(fetch_ohlcv(sym)))
-        except Exception as exc:
-            logger.warning("Symbol load failed: %s (%s)", sym, exc)
-
-    if not symbol_dfs:
-        raise RuntimeError("No symbol data loaded successfully.")
-
-    logger.info("Loaded OHLCV for %d symbols", len(symbol_dfs))
-    return symbol_dfs, market_df
-
-
-def _get_signal_asof_date(market_df: pd.DataFrame, today_et: date) -> pd.Timestamp:
-    cutoff = pd.Timestamp(today_et) - pd.Timedelta(days=1)
-    hist = market_df.index[market_df.index <= cutoff]
-    if len(hist) == 0:
-        raise RuntimeError("No completed market history is available for signal generation.")
-    return pd.Timestamp(hist.max())
 
 
 def _build_rebalance_calendar(
@@ -177,7 +133,7 @@ def _build_rebalance_calendar(
     start = today_et - timedelta(days=cfg.rebalance_calendar_days_back)
     days = broker.get_trading_days(start=start, end=today_et)
     if not days:
-        raise RuntimeError("No Alpaca trading calendar days returned.")
+        raise RuntimeError("No Alpaca trading calendar days returned")
 
     cal = pd.DatetimeIndex(pd.to_datetime(days)).sort_values()
     rebals = _week_rebalance_dates(cal, weekday=0)
@@ -190,306 +146,330 @@ def _build_rebalance_calendar(
     return pd.DatetimeIndex(rebals)
 
 
-def _build_target_table(
-    target: Dict[str, Any],
-    deployment_capital: float,
-    prices: Dict[str, float],
-) -> pd.DataFrame:
-    rows = []
-    for sym in target["selected_symbols"]:
-        w = float(target["target_weights"].get(sym, 0.0))
-        port_w = float(target["target_exposure"] * w)
-        px = prices.get(sym)
-        if px is None or not np.isfinite(px) or px <= 0:
-            raise RuntimeError(f"Missing/invalid price for target symbol {sym}")
-        target_dollar = deployment_capital * port_w
-        target_shares = target_dollar / px
-        rows.append(
-            {
-                "symbol": sym,
-                "target_weight": port_w,
-                "target_dollar": target_dollar,
-                "reference_price": px,
-                "target_shares": target_shares,
-            }
-        )
-    return pd.DataFrame(rows).sort_values("target_weight", ascending=False).reset_index(drop=True)
+def _load_strategy_data(logger: logging.Logger) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    symbols = build_universe_from_stooq(STOOQ_DIR)
+    _log_event(logger, "strategy_universe", symbol_count=len(symbols))
+
+    market_df = _ensure_datetime_index(_normalize_cols(fetch_ohlcv("SPY")))
+
+    symbol_dfs: dict[str, pd.DataFrame] = {}
+    for sym in symbols:
+        try:
+            symbol_dfs[sym] = _ensure_datetime_index(_normalize_cols(fetch_ohlcv(sym)))
+        except Exception as exc:
+            _log_event(logger, "symbol_load_failed", symbol=sym, error=str(exc))
+
+    if not symbol_dfs:
+        raise RuntimeError("No symbol data loaded from Stooq cache")
+
+    _log_event(logger, "strategy_data_loaded", loaded_symbols=len(symbol_dfs))
+    return symbol_dfs, market_df
 
 
-def _current_positions_df(positions: Iterable[Any]) -> pd.DataFrame:
-    rows = []
-    for p in positions:
-        rows.append(
-            {
-                "symbol": str(getattr(p, "symbol", "")),
-                "current_shares": _to_float(getattr(p, "qty", 0.0)),
-                "market_value": _to_float(getattr(p, "market_value", 0.0)),
-                "avg_entry_price": _to_float(getattr(p, "avg_entry_price", 0.0)),
-                "side": str(getattr(p, "side", "long")),
-            }
-        )
-    if not rows:
-        return pd.DataFrame(columns=["symbol", "current_shares", "market_value", "avg_entry_price", "side"])
-    return pd.DataFrame(rows).sort_values("symbol").reset_index(drop=True)
+def _get_signal_asof_date(market_df: pd.DataFrame, today_et: date) -> pd.Timestamp:
+    cutoff = pd.Timestamp(today_et) - pd.Timedelta(days=1)
+    hist = market_df.index[market_df.index <= cutoff]
+    if len(hist) == 0:
+        raise RuntimeError("No completed market history is available for signal generation")
+    return pd.Timestamp(hist.max())
 
 
-def _build_order_plan(
-    current_df: pd.DataFrame,
-    target_df: pd.DataFrame,
-    prices: Dict[str, float],
+def _fetch_latest_prices(broker: AlpacaBroker, symbols: Iterable[str]) -> Dict[str, float]:
+    prices: Dict[str, float] = {}
+    for sym in sorted({str(s).strip().upper() for s in symbols if str(s).strip()}):
+        px = broker.get_latest_trade_price(sym)
+        if px is None:
+            continue
+        if float(px) <= 0:
+            continue
+        prices[sym] = float(px)
+    return prices
+
+
+def _orders_to_rows(orders: List[PlannedOrder]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for o in orders:
+        rows.append(asdict(o))
+    rows.sort(key=lambda x: (0 if x["side"] == "sell" else 1, -float(x.get("target_notional", 0.0))))
+    return rows
+
+
+def _save_rebalance_summary(
     cfg: LiveTradingConfig,
-) -> pd.DataFrame:
-    cur = {r.symbol: float(r.current_shares) for r in current_df.itertuples(index=False)}
-    tgt = {r.symbol: float(r.target_shares) for r in target_df.itertuples(index=False)}
+    run_id: str,
+    payload: Dict[str, Any],
+    orders_rows: List[Dict[str, Any]],
+    positions_rows: List[Dict[str, Any]],
+) -> None:
+    cfg.logs_dir.mkdir(parents=True, exist_ok=True)
 
-    all_symbols = sorted(set(cur.keys()) | set(tgt.keys()))
-    rows = []
+    summary_json = cfg.logs_dir / f"rebalance_summary_{run_id}.json"
+    summary_txt = cfg.logs_dir / f"rebalance_summary_{run_id}.txt"
+    orders_csv = cfg.logs_dir / f"rebalance_orders_{run_id}.csv"
+    positions_csv = cfg.logs_dir / f"rebalance_positions_{run_id}.csv"
 
-    for sym in all_symbols:
-        current_shares = float(cur.get(sym, 0.0))
-        target_shares = float(tgt.get(sym, 0.0))
-        delta = target_shares - current_shares
-        px = prices.get(sym)
-        if px is None or not np.isfinite(px) or px <= 0:
-            continue
+    summary_json.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
 
-        notional = abs(delta) * px
-        if abs(delta) < cfg.min_share_delta or notional < cfg.min_notional_trade:
-            continue
+    lines = [
+        f"run_id: {run_id}",
+        f"timestamp_et: {payload.get('timestamp_et')}",
+        f"mode: {'DRY_RUN' if payload.get('dry_run') else 'LIVE'}",
+        f"account_equity: {payload.get('account_equity')}",
+        f"buying_power: {payload.get('buying_power')}",
+        f"target_symbols: {','.join(payload.get('target_symbols', []))}",
+        f"planned_orders: {len(orders_rows)}",
+        f"liquidation_mode: {payload.get('liquidation_mode')}",
+        "",
+        "abort_reasons:",
+    ]
+    for reason in payload.get("abort_reasons", []):
+        lines.append(f"- {reason}")
 
-        side = "buy" if delta > 0 else "sell"
-        limit_price = px * (cfg.buy_limit_buffer if side == "buy" else cfg.sell_limit_buffer)
+    summary_txt.write_text("\n".join(lines), encoding="utf-8")
 
-        if current_shares == 0 and target_shares > 0:
-            reason = "new position"
-        elif current_shares > 0 and target_shares == 0:
-            reason = "exit"
-        else:
-            reason = "rebalance resize"
-
-        rows.append(
-            {
-                "symbol": sym,
-                "side": side,
-                "current_shares": current_shares,
-                "target_shares": target_shares,
-                "delta_shares": delta,
-                "reference_price": px,
-                "limit_price": limit_price,
-                "estimated_notional": notional,
-                "reason": reason,
-            }
-        )
-
-    if not rows:
-        return pd.DataFrame(
-            columns=[
-                "symbol",
-                "side",
-                "current_shares",
-                "target_shares",
-                "delta_shares",
-                "reference_price",
-                "limit_price",
-                "estimated_notional",
-                "reason",
-            ]
-        )
-
-    orders = pd.DataFrame(rows)
-    orders["side_rank"] = np.where(orders["side"] == "sell", 0, 1)
-    orders = orders.sort_values(["side_rank", "estimated_notional"], ascending=[True, False]).drop(columns=["side_rank"])
-    return orders.reset_index(drop=True)
+    pd.DataFrame(orders_rows).to_csv(orders_csv, index=False)
+    pd.DataFrame(positions_rows).to_csv(positions_csv, index=False)
 
 
-def _log_table(logger: logging.Logger, title: str, df: pd.DataFrame) -> None:
-    logger.info("=== %s ===", title)
-    if df.empty:
-        logger.info("(empty)")
-    else:
-        logger.info("\n%s", df.to_string(index=False))
+def _build_creds_from_cfg(cfg: LiveTradingConfig) -> AlpacaCredentials:
+    missing = []
+    if not cfg.alpaca_api_key:
+        missing.append("ALPACA_API_KEY")
+    if not cfg.alpaca_secret_key:
+        missing.append("ALPACA_SECRET_KEY")
+    if not cfg.alpaca_base_url:
+        missing.append("ALPACA_BASE_URL")
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
-
-def _checklist_item(name: str, ok: bool) -> str:
-    return f"- [{'OK' if ok else 'FAIL'}] {name}"
+    return AlpacaCredentials(
+        api_key=cfg.alpaca_api_key,
+        secret_key=cfg.alpaca_secret_key,
+        base_url=cfg.alpaca_base_url,
+    )
 
 
 def _submit_orders(
     broker: AlpacaBroker,
-    orders_df: pd.DataFrame,
-    run_id: str,
-    cfg: LiveTradingConfig,
     logger: logging.Logger,
-) -> pd.DataFrame:
-    results: list[dict[str, Any]] = []
+    orders_rows: List[Dict[str, Any]],
+    run_id: str,
+    tif: str,
+) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
 
-    for idx, row in enumerate(orders_df.itertuples(index=False), start=1):
+    for idx, row in enumerate(orders_rows, start=1):
+        symbol = str(row["symbol"]).upper()
+        side = str(row["side"]).lower()
+        limit_price = float(row["limit_price"])
+        reason = str(row.get("reason", ""))
         cid = f"mom-{run_id}-{idx}"
-        symbol = str(row.symbol)
-        side = str(row.side)
-        qty = abs(float(row.delta_shares))
-        limit_price = float(row.limit_price)
 
-        logger.info("Submitting %s %s qty=%.6f @ %.4f", side.upper(), symbol, qty, limit_price)
+        try:
+            if side == "buy":
+                notional = float(row.get("notional") or 0.0)
+                if notional <= 0:
+                    raise ValueError(f"Invalid buy notional for {symbol}: {notional}")
+                _log_event(
+                    logger,
+                    "submit_buy_notional",
+                    symbol=symbol,
+                    notional=notional,
+                    limit_price=limit_price,
+                    client_order_id=cid,
+                    reason=reason,
+                )
+                order = broker.submit_fractional_buy_notional(
+                    symbol=symbol,
+                    notional=notional,
+                    limit_price=limit_price,
+                    client_order_id=cid,
+                    tif=tif,
+                )
+            elif side == "sell":
+                qty = float(row.get("qty") or 0.0)
+                if qty <= 0:
+                    raise ValueError(f"Invalid sell qty for {symbol}: {qty}")
+                _log_event(
+                    logger,
+                    "submit_sell_qty",
+                    symbol=symbol,
+                    qty=qty,
+                    limit_price=limit_price,
+                    client_order_id=cid,
+                    reason=reason,
+                )
+                order = broker.submit_fractional_sell_qty(
+                    symbol=symbol,
+                    qty=qty,
+                    limit_price=limit_price,
+                    client_order_id=cid,
+                    tif=tif,
+                )
+            else:
+                raise ValueError(f"Invalid order side: {side}")
 
-        order = broker.submit_limit_order(
-            symbol=symbol,
-            side=side,
-            qty=qty,
-            limit_price=limit_price,
-            client_order_id=cid,
-        )
+            order_id = str(getattr(order, "id", ""))
+            latest = order
+            if order_id:
+                try:
+                    latest = broker.get_order(order_id)
+                except Exception:
+                    latest = order
 
-        order_id = str(getattr(order, "id", ""))
-        time.sleep(max(cfg.retry_wait_seconds, 1))
-        latest = broker.get_order(order_id)
-        status = str(getattr(latest, "status", "unknown"))
-
-        retried = False
-        if cfg.retry_enabled and status.lower() in {"new", "accepted", "pending_new", "partially_filled"}:
-            retried = True
-            try:
-                broker.cancel_order(order_id)
-            except Exception as exc:
-                logger.warning("Cancel failed for %s (%s): %s", symbol, order_id, exc)
-
-            widened = float(
-                row.reference_price
-                * (cfg.retry_buy_limit_buffer if side == "buy" else cfg.retry_sell_limit_buffer)
-            )
-            cid2 = f"mom-{run_id}-{idx}-r1"
-            logger.info("Retrying %s %s qty=%.6f @ %.4f", side.upper(), symbol, qty, widened)
-            order2 = broker.submit_limit_order(
-                symbol=symbol,
-                side=side,
-                qty=qty,
-                limit_price=widened,
-                client_order_id=cid2,
-            )
-            order2_id = str(getattr(order2, "id", ""))
-            time.sleep(max(cfg.retry_wait_seconds, 1))
-            latest = broker.get_order(order2_id)
             status = str(getattr(latest, "status", "unknown"))
-            order_id = order2_id
-            limit_price = widened
+            filled_qty = _to_float(getattr(latest, "filled_qty", 0.0))
+            filled_avg_price = _to_float(getattr(latest, "filled_avg_price", 0.0))
+            results.append(
+                {
+                    "symbol": symbol,
+                    "side": side,
+                    "order_id": order_id,
+                    "status": status,
+                    "client_order_id": cid,
+                    "filled_qty": filled_qty,
+                    "filled_avg_price": filled_avg_price,
+                    "error": "",
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "symbol": symbol,
+                    "side": side,
+                    "order_id": "",
+                    "status": "submit_error",
+                    "client_order_id": cid,
+                    "filled_qty": 0.0,
+                    "filled_avg_price": 0.0,
+                    "error": str(exc),
+                }
+            )
+            _log_event(logger, "order_submit_error", symbol=symbol, side=side, error=str(exc))
 
-        results.append(
-            {
-                "symbol": symbol,
-                "side": side,
-                "qty": qty,
-                "limit_price": limit_price,
-                "order_id": order_id,
-                "status": status,
-                "retried": retried,
-            }
-        )
+        time.sleep(0.25)
 
-    return pd.DataFrame(results)
+    return results
 
 
 def main() -> None:
     args = _parse_args()
 
-    dry_run = True
-    if args.live and not args.dry_run:
+    cfg = load_live_trading_config()
+    dry_run = cfg.dry_run
+    if args.live:
         dry_run = False
+    if args.dry_run:
+        dry_run = True
 
-    cfg = LiveTradingConfig()
     run_id = datetime.now(tz=ET).strftime("%Y%m%d_%H%M%S")
     logger = _setup_logging(cfg=cfg, run_id=run_id, verbose=args.verbose)
-    ctx = RuntimeContext(run_id=run_id, logger=logger, config=cfg, dry_run=dry_run, force=args.force, verbose=args.verbose)
+    ctx = RuntimeContext(run_id=run_id, dry_run=dry_run, force=args.force, verbose=args.verbose)
 
     try:
-        creds = _load_creds_from_env()
+        creds = _build_creds_from_cfg(cfg)
         broker = AlpacaBroker(creds)
     except AlpacaDependencyError as exc:
         logger.error("%s", exc)
         sys.exit(2)
     except Exception as exc:
-        logger.error("Client initialization failed: %s", exc)
+        logger.error("broker_init_failed: %s", exc)
         sys.exit(2)
 
-    account = broker.get_account()
-    clock = broker.get_clock()
+    try:
+        account = broker.get_account()
+        clock = broker.get_clock()
+    except Exception as exc:
+        logger.error("failed_to_fetch_account_or_clock: %s", exc)
+        return
+
     now_et = getattr(clock, "timestamp", datetime.now(tz=ET))
     if now_et.tzinfo is None:
         now_et = now_et.replace(tzinfo=ET)
     now_et = now_et.astimezone(ET)
     today_et = now_et.date()
+    cycle_key = f"{today_et.isoformat()}_{cfg.execution_window_start.strftime('%H%M')}_{cfg.execution_window_end.strftime('%H%M')}"
 
     account_equity = _to_float(getattr(account, "equity", 0.0))
     account_cash = _to_float(getattr(account, "cash", 0.0))
     buying_power = _to_float(getattr(account, "buying_power", 0.0))
 
-    account_mode = "paper" if "paper" in creds.base_url.lower() else "live"
+    _log_event(
+        logger,
+        "account_snapshot",
+        timestamp_et=now_et.isoformat(),
+        account_equity=account_equity,
+        cash=account_cash,
+        buying_power=buying_power,
+        paper_mode=("paper" in creds.base_url.lower()),
+        dry_run=ctx.dry_run,
+        first_run_liquidate_all=cfg.first_run_liquidate_all,
+    )
 
-    logger.info("=== ACCOUNT SUMMARY ===")
-    logger.info("mode=%s dry_run=%s force=%s", account_mode, ctx.dry_run, ctx.force)
-    logger.info("equity=%.2f cash=%.2f buying_power=%.2f", account_equity, account_cash, buying_power)
-
-    window_ok = _within_execution_window(now_et, cfg)
+    window_ok = within_execution_window(now_et, cfg.execution_window_start, cfg.execution_window_end)
     market_open = bool(getattr(clock, "is_open", False))
 
-    cal_start = today_et - timedelta(days=cfg.rebalance_calendar_days_back)
-    trading_days = broker.get_trading_days(cal_start, today_et)
-    trading_day_set = {pd.Timestamp(d).date() for d in trading_days}
-    is_trading_day = today_et in trading_day_set
-
-    rebals = _build_rebalance_calendar(broker, cfg, today_et)
-    is_rebalance_day = pd.Timestamp(today_et) in rebals
-
     state = load_state(cfg.state_file)
-    duplicate_run = state.get("last_rebalance_date") == str(today_et)
-
-    symbol_dfs, market_df = _load_strategy_data(logger)
-    signal_asof = _get_signal_asof_date(market_df, today_et=today_et)
-    signal_staleness_days = (today_et - signal_asof.date()).days
-    data_fresh = signal_staleness_days <= cfg.max_signal_staleness_days
-
-    checklist = [
-        _checklist_item("credentials loaded", True),
-        _checklist_item("account mode confirmed", account_mode in {"paper", "live"}),
-        _checklist_item("market open", market_open),
-        _checklist_item("execution window valid (or --force)", window_ok or ctx.force),
-        _checklist_item("rebalance day confirmed", is_rebalance_day),
-        _checklist_item("data fresh", data_fresh),
-        _checklist_item("no duplicate execution today", (not duplicate_run) or ctx.force),
-        _checklist_item("run mode explicit", (ctx.dry_run or args.live)),
-    ]
-
-    logger.info("=== LIVE-READINESS CHECKLIST ===")
-    for line in checklist:
-        logger.info(line)
-
-    if not is_trading_day:
-        logger.warning("Rebalance skipped: non-trading day")
-        return
+    duplicate_cycle = state.get("last_cycle_key") == cycle_key
 
     if not market_open:
-        logger.warning("Rebalance skipped: market closed")
+        _log_event(logger, "skip_cycle", reason="market_closed")
         return
 
     if not window_ok and not ctx.force:
-        logger.warning("Execution blocked: outside window (%s-%s ET)", cfg.execution_window_start, cfg.execution_window_end)
+        _log_event(
+            logger,
+            "skip_cycle",
+            reason="outside_execution_window",
+            window_start=str(cfg.execution_window_start),
+            window_end=str(cfg.execution_window_end),
+            now_et=now_et.isoformat(),
+        )
         return
 
-    if duplicate_run and not ctx.force:
-        logger.warning("Execution blocked: duplicate run detected")
+    if duplicate_cycle and not ctx.force:
+        _log_event(logger, "skip_cycle", reason="duplicate_cycle", cycle_key=cycle_key)
         return
 
-    if not data_fresh:
-        logger.error("Freshness check failed: signal data is %d days old", signal_staleness_days)
+    account_gate = validate_account_for_trading(account)
+    if not account_gate.ok:
+        for reason in account_gate.reasons:
+            _log_event(logger, "abort", reason=reason)
         return
 
-    if not is_rebalance_day:
-        logger.info("=== STRATEGY SUMMARY ===")
-        logger.info("Rebalance skipped: cadence not due")
-        positions_df = _current_positions_df(broker.get_positions())
-        _log_table(logger, "CURRENT HOLDINGS", positions_df)
+    if cfg.cancel_open_orders_on_start:
+        try:
+            broker.cancel_open_orders()
+            _log_event(logger, "cancel_open_orders", status="requested")
+        except Exception as exc:
+            _log_event(logger, "abort", reason=f"cancel_open_orders_failed: {exc}")
+            return
+
+    try:
+        symbol_dfs, market_df = _load_strategy_data(logger)
+        signal_asof = _get_signal_asof_date(market_df, today_et=today_et)
+    except Exception as exc:
+        _log_event(logger, "abort", reason=f"strategy_data_load_failed: {exc}")
+        return
+
+    signal_staleness_days = (today_et - signal_asof.date()).days
+    if signal_staleness_days > cfg.max_signal_staleness_days:
+        _log_event(logger, "abort", reason=f"signal_staleness_days={signal_staleness_days}")
+        return
+
+    try:
+        rebals = _build_rebalance_calendar(broker=broker, cfg=cfg, today_et=today_et)
+    except Exception as exc:
+        _log_event(logger, "abort", reason=f"rebalance_calendar_failed: {exc}")
+        return
+
+    if pd.Timestamp(today_et) not in rebals:
+        _log_event(logger, "skip_cycle", reason="not_rebalance_day")
         return
 
     baseline_cfg = build_baseline_cfg()
+
+    # Strategy target source is currently compute_rebalance_target(); update here if you switch target provider.
     target = compute_rebalance_target(
         symbol_dfs=symbol_dfs,
         market_df=market_df,
@@ -498,104 +478,189 @@ def main() -> None:
         ranking_history=[],
     )
 
-    selected_symbols = list(target["selected_symbols"])
-    target_weights = dict(target["target_weights"])
-    target_exposure = float(target["target_exposure"])
-
-    logger.info("=== STRATEGY SUMMARY ===")
-    logger.info("rebalance_day=%s signal_asof=%s risk_on=%s target_exposure=%.2f", is_rebalance_day, signal_asof.date(), target["risk_on"], target_exposure)
-    logger.info("selected_symbols=%s", "|".join(selected_symbols))
+    selected_symbols = [str(s).strip().upper() for s in target.get("selected_symbols", [])]
+    target_weights = {str(k).strip().upper(): float(v) for k, v in dict(target.get("target_weights", {})).items()}
+    target_exposure = float(target.get("target_exposure", 0.0))
 
     if not selected_symbols:
-        logger.error("Target generation failed: empty selection")
+        _log_event(logger, "abort", reason="empty_target_symbols")
         return
 
-    expected_weight = target_exposure / len(selected_symbols)
-    for sym, w in target_weights.items():
-        port_weight = target_exposure * float(w)
-        if abs(port_weight - expected_weight) > cfg.max_position_weight_tolerance:
-            raise RuntimeError(
-                f"Unexpected target weight distortion for {sym}: {port_weight:.4f} vs expected {expected_weight:.4f}"
-            )
+    if len(selected_symbols) > cfg.max_positions:
+        _log_event(
+            logger,
+            "target_trimmed",
+            requested_positions=len(selected_symbols),
+            max_positions=cfg.max_positions,
+        )
+        selected_symbols = selected_symbols[: cfg.max_positions]
 
-    positions_df = _current_positions_df(broker.get_positions())
-    _log_table(logger, "CURRENT HOLDINGS", positions_df)
-
-    price_symbols = sorted(set(selected_symbols) | set(positions_df["symbol"].tolist()))
-    prices: Dict[str, float] = {}
-    missing_price_symbols: list[str] = []
-    for sym in price_symbols:
-        px = broker.get_latest_trade_price(sym)
-        if px is None or not np.isfinite(px) or px <= 0:
-            missing_price_symbols.append(sym)
-            continue
-        prices[sym] = float(px)
-
-    if any(sym in selected_symbols for sym in missing_price_symbols):
-        logger.error("Missing market prices for target symbols: %s", ", ".join(sorted(set(missing_price_symbols) & set(selected_symbols))))
+    try:
+        positions = broker.get_positions()
+    except Exception as exc:
+        _log_event(logger, "abort", reason=f"positions_fetch_failed: {exc}")
         return
 
-    deployment_capital = account_equity * cfg.max_deployment_fraction
-    target_df = _build_target_table(target=target, deployment_capital=deployment_capital, prices=prices)
-    _log_table(logger, "TARGET PORTFOLIO", target_df)
+    position_snapshots = positions_from_alpaca(positions)
+    positions_rows = [asdict(p) for p in position_snapshots]
 
-    orders_df = _build_order_plan(current_df=positions_df, target_df=target_df, prices=prices, cfg=cfg)
-    _log_table(logger, "PROPOSED ORDERS", orders_df)
+    price_universe = set(selected_symbols) | {p.symbol for p in position_snapshots}
+    latest_prices = _fetch_latest_prices(broker, price_universe)
 
-    total_buy_notional = float(orders_df.loc[orders_df["side"] == "buy", "estimated_notional"].sum()) if not orders_df.empty else 0.0
-    total_sell_notional = float(orders_df.loc[orders_df["side"] == "sell", "estimated_notional"].sum()) if not orders_df.empty else 0.0
-    est_post_trade_cash = account_cash + total_sell_notional - total_buy_notional
+    liquidation_active = bool(cfg.first_run_liquidate_all and not state.get("first_run_liquidation_done", False))
 
-    logger.info("Order sanity: count=%d buy_notional=%.2f sell_notional=%.2f est_post_trade_cash=%.2f", len(orders_df), total_buy_notional, total_sell_notional, est_post_trade_cash)
+    plan = build_rebalance_plan(
+        selected_symbols=selected_symbols,
+        target_weights=target_weights,
+        target_exposure=target_exposure,
+        account_equity=account_equity,
+        max_deployment_pct=cfg.max_deployment_pct,
+        current_positions=position_snapshots,
+        latest_prices=latest_prices,
+        min_trade_notional=cfg.min_trade_notional,
+        buy_limit_buffer_bps=cfg.buy_limit_buffer_bps,
+        sell_limit_buffer_bps=cfg.sell_limit_buffer_bps,
+        min_sell_qty=cfg.min_sell_qty,
+        max_positions=cfg.max_positions,
+        first_run_liquidate_all=liquidation_active,
+    )
 
-    if (not cfg.allow_margin) and est_post_trade_cash < -1e-6:
-        logger.error("Estimated post-trade cash would be negative (margin disabled); aborting.")
+    orders_rows = _orders_to_rows(plan.orders)
+
+    if plan.abort_reasons:
+        for reason in plan.abort_reasons:
+            _log_event(logger, "abort", reason=reason)
+        summary_payload = {
+            "timestamp_et": now_et.isoformat(),
+            "dry_run": ctx.dry_run,
+            "account_equity": account_equity,
+            "buying_power": buying_power,
+            "target_symbols": selected_symbols,
+            "liquidation_mode": plan.liquidation_mode,
+            "abort_reasons": plan.abort_reasons,
+        }
+        _save_rebalance_summary(cfg, run_id, summary_payload, orders_rows, positions_rows)
         return
 
-    cfg.logs_dir.mkdir(parents=True, exist_ok=True)
-    targets_fp = cfg.logs_dir / f"live_targets_{run_id}.csv"
-    orders_fp = cfg.logs_dir / f"live_orders_{run_id}.csv"
-    target_df.to_csv(targets_fp, index=False)
-    orders_df.to_csv(orders_fp, index=False)
-    logger.info("Saved targets to %s", targets_fp)
-    logger.info("Saved proposed orders to %s", orders_fp)
+    shape_gate = validate_order_plan_shape(orders_rows, cfg.max_order_count)
+    if not shape_gate.ok:
+        for reason in shape_gate.reasons:
+            _log_event(logger, "abort", reason=reason)
+        summary_payload = {
+            "timestamp_et": now_et.isoformat(),
+            "dry_run": ctx.dry_run,
+            "account_equity": account_equity,
+            "buying_power": buying_power,
+            "target_symbols": selected_symbols,
+            "liquidation_mode": plan.liquidation_mode,
+            "abort_reasons": shape_gate.reasons,
+        }
+        _save_rebalance_summary(cfg, run_id, summary_payload, orders_rows, positions_rows)
+        return
+
+    try:
+        open_orders = broker.get_open_orders()
+    except Exception as exc:
+        _log_event(logger, "abort", reason=f"open_orders_fetch_failed: {exc}")
+        return
+
+    filtered_orders, skipped_pending = filter_symbols_already_pending(orders_rows, open_orders)
+    for reason in skipped_pending:
+        _log_event(logger, "idempotency_skip", reason=reason)
+
+    symbols_for_assets = sorted({str(r["symbol"]).upper() for r in filtered_orders})
+    assets: Dict[str, Any] = {}
+    for sym in symbols_for_assets:
+        try:
+            assets[sym] = broker.get_asset(sym)
+        except Exception as exc:
+            _log_event(logger, "abort", reason=f"asset_lookup_failed_{sym}: {exc}")
+            return
+
+    asset_gate = validate_assets_for_orders(filtered_orders, assets)
+    if not asset_gate.ok:
+        for reason in asset_gate.reasons:
+            _log_event(logger, "abort", reason=reason)
+        summary_payload = {
+            "timestamp_et": now_et.isoformat(),
+            "dry_run": ctx.dry_run,
+            "account_equity": account_equity,
+            "buying_power": buying_power,
+            "target_symbols": selected_symbols,
+            "liquidation_mode": plan.liquidation_mode,
+            "abort_reasons": asset_gate.reasons,
+        }
+        _save_rebalance_summary(cfg, run_id, summary_payload, filtered_orders, positions_rows)
+        return
+
+    _log_event(
+        logger,
+        "rebalance_plan",
+        current_positions=positions_rows,
+        target_notional=plan.target_notional_by_symbol,
+        order_count=len(filtered_orders),
+        orders=filtered_orders,
+        liquidation_mode=plan.liquidation_mode,
+    )
+
+    summary_payload = {
+        "timestamp_et": now_et.isoformat(),
+        "dry_run": ctx.dry_run,
+        "account_equity": account_equity,
+        "buying_power": buying_power,
+        "target_symbols": selected_symbols,
+        "target_notional": plan.target_notional_by_symbol,
+        "liquidation_mode": plan.liquidation_mode,
+        "abort_reasons": [],
+    }
+    _save_rebalance_summary(cfg, run_id, summary_payload, filtered_orders, positions_rows)
 
     if ctx.dry_run:
-        logger.info("=== EXECUTION RESULT ===")
-        logger.info("Dry run complete: no orders submitted")
+        _log_event(logger, "dry_run_complete", submitted_orders=0)
         return
 
-    if account_mode == "live" and not args.live:
-        logger.error("Live account detected but --live was not provided; aborting.")
+    if not filtered_orders:
+        _log_event(logger, "live_complete", submitted_orders=0, reason="no_orders_after_filters")
         return
 
-    if orders_df.empty:
-        logger.info("=== EXECUTION RESULT ===")
-        logger.info("No orders to place after thresholds.")
-        return
+    sells = [r for r in filtered_orders if str(r["side"]).lower() == "sell"]
+    buys = [r for r in filtered_orders if str(r["side"]).lower() == "buy"]
+    ordered = sells + buys
 
-    logger.info("=== EXECUTION RESULT ===")
-    logger.info("Submitting %d orders (sells first, then buys)...", len(orders_df))
-
-    exec_df = _submit_orders(
+    exec_rows = _submit_orders(
         broker=broker,
-        orders_df=orders_df,
-        run_id=run_id,
-        cfg=cfg,
         logger=logger,
+        orders_rows=ordered,
+        run_id=run_id,
+        tif=cfg.time_in_force,
     )
 
     exec_fp = cfg.logs_dir / f"live_execution_{run_id}.csv"
-    exec_df.to_csv(exec_fp, index=False)
-    _log_table(logger, "ORDER STATUS", exec_df)
-    logger.info("Saved execution report to %s", exec_fp)
+    pd.DataFrame(exec_rows).to_csv(exec_fp, index=False)
+    _log_event(logger, "execution_results", report_path=str(exec_fp), results=exec_rows)
 
     state["last_rebalance_date"] = str(today_et)
     state["last_successful_run_ts"] = datetime.now(tz=ET).isoformat()
     state["last_target_symbols"] = selected_symbols
-    state["last_mode"] = account_mode
+    state["last_mode"] = "dry_run" if ctx.dry_run else "live"
+    state["last_cycle_key"] = cycle_key
+
+    if plan.liquidation_mode:
+        try:
+            time.sleep(2.0)
+            remaining_positions = positions_from_alpaca(broker.get_positions())
+            nonzero = [p for p in remaining_positions if p.qty > cfg.min_sell_qty]
+            state["first_run_liquidation_done"] = len(nonzero) == 0
+            _log_event(
+                logger,
+                "first_run_liquidation_status",
+                liquidation_done=state["first_run_liquidation_done"],
+                remaining_symbols=[p.symbol for p in nonzero],
+            )
+        except Exception as exc:
+            _log_event(logger, "first_run_liquidation_status_error", error=str(exc))
+
     save_state(cfg.state_file, state)
-    logger.info("Updated state file: %s", cfg.state_file)
 
 
 if __name__ == "__main__":

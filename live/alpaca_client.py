@@ -12,7 +12,7 @@ class AlpacaDependencyError(RuntimeError):
 def _import_alpaca() -> Dict[str, Any]:
     try:
         from alpaca.trading.client import TradingClient
-        from alpaca.trading.requests import GetCalendarRequest, GetOrdersRequest, LimitOrderRequest
+        from alpaca.trading.requests import GetCalendarRequest, GetOrdersRequest, LimitOrderRequest, ClosePositionRequest
         from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
         from alpaca.data.historical.stock import StockHistoricalDataClient
         from alpaca.data.requests import StockLatestTradeRequest
@@ -22,6 +22,7 @@ def _import_alpaca() -> Dict[str, Any]:
             "GetCalendarRequest": GetCalendarRequest,
             "GetOrdersRequest": GetOrdersRequest,
             "LimitOrderRequest": LimitOrderRequest,
+            "ClosePositionRequest": ClosePositionRequest,
             "OrderSide": OrderSide,
             "TimeInForce": TimeInForce,
             "QueryOrderStatus": QueryOrderStatus,
@@ -69,8 +70,14 @@ class AlpacaBroker:
     def get_clock(self) -> Any:
         return self._trading.get_clock()
 
+    def get_asset(self, symbol: str) -> Any:
+        return self._trading.get_asset(symbol)
+
     def get_positions(self) -> List[Any]:
         return list(self._trading.get_all_positions())
+
+    def get_position(self, symbol: str) -> Any:
+        return self._trading.get_open_position(symbol)
 
     def get_latest_trade_price(self, symbol: str) -> Optional[float]:
         req = self._m["StockLatestTradeRequest"](symbol_or_symbols=symbol)
@@ -90,23 +97,100 @@ class AlpacaBroker:
         self,
         symbol: str,
         side: str,
-        qty: float,
+        qty: Optional[float],
+        notional: Optional[float],
         limit_price: float,
         client_order_id: str,
+        tif: str = "day",
     ) -> Any:
         if side not in {"buy", "sell"}:
             raise ValueError(f"Unsupported side: {side}")
+        if qty is None and notional is None:
+            raise ValueError("One of qty or notional must be provided")
+        if qty is not None and notional is not None:
+            raise ValueError("Only one of qty or notional can be provided")
+        if qty is not None and float(qty) <= 0:
+            raise ValueError("qty must be positive")
+        if notional is not None and float(notional) <= 0:
+            raise ValueError("notional must be positive")
+        if float(limit_price) <= 0:
+            raise ValueError("limit_price must be positive")
 
         order_side = self._m["OrderSide"].BUY if side == "buy" else self._m["OrderSide"].SELL
+        tif_value = self._m["TimeInForce"].DAY if tif.lower() == "day" else self._m["TimeInForce"].GTC
+
+        req_kwargs: Dict[str, Any] = {
+            "symbol": symbol,
+            "side": order_side,
+            "time_in_force": tif_value,
+            "limit_price": round(float(limit_price), 4),
+            "client_order_id": client_order_id,
+        }
+        if qty is not None:
+            req_kwargs["qty"] = round(float(qty), 6)
+        if notional is not None:
+            req_kwargs["notional"] = round(float(notional), 2)
+
         req = self._m["LimitOrderRequest"](
-            symbol=symbol,
-            qty=round(float(qty), 6),
-            side=order_side,
-            time_in_force=self._m["TimeInForce"].DAY,
-            limit_price=round(float(limit_price), 4),
-            client_order_id=client_order_id,
+            **req_kwargs,
         )
         return self._trading.submit_order(order_data=req)
+
+    def submit_fractional_buy_notional(
+        self,
+        symbol: str,
+        notional: float,
+        limit_price: float,
+        client_order_id: str,
+        tif: str = "day",
+    ) -> Any:
+        return self.submit_limit_order(
+            symbol=symbol,
+            side="buy",
+            qty=None,
+            notional=notional,
+            limit_price=limit_price,
+            client_order_id=client_order_id,
+            tif=tif,
+        )
+
+    def submit_fractional_sell_qty(
+        self,
+        symbol: str,
+        qty: float,
+        limit_price: float,
+        client_order_id: str,
+        tif: str = "day",
+    ) -> Any:
+        return self.submit_limit_order(
+            symbol=symbol,
+            side="sell",
+            qty=qty,
+            notional=None,
+            limit_price=limit_price,
+            client_order_id=client_order_id,
+            tif=tif,
+        )
+
+    def close_position(
+        self,
+        symbol: str,
+        qty: float,
+        limit_price: float,
+        tif: str = "day",
+        client_order_id: Optional[str] = None,
+    ) -> Any:
+        tif_value = self._m["TimeInForce"].DAY if tif.lower() == "day" else self._m["TimeInForce"].GTC
+        req = self._m["ClosePositionRequest"](
+            qty=round(float(qty), 6),
+            limit_price=round(float(limit_price), 4),
+            time_in_force=tif_value,
+            client_order_id=client_order_id,
+        )
+        return self._trading.close_position(symbol_or_asset_id=symbol, close_options=req)
+
+    def close_all_positions(self, cancel_orders: bool = False) -> Any:
+        return self._trading.close_all_positions(cancel_orders=cancel_orders)
 
     def get_order(self, order_id: str) -> Any:
         return self._trading.get_order_by_id(order_id)
@@ -114,6 +198,12 @@ class AlpacaBroker:
     def cancel_order(self, order_id: str) -> None:
         self._trading.cancel_order_by_id(order_id)
 
-    def list_open_orders(self) -> List[Any]:
+    def get_open_orders(self) -> List[Any]:
         req = self._m["GetOrdersRequest"](status=self._m["QueryOrderStatus"].OPEN)
         return list(self._trading.get_orders(filter=req))
+
+    def list_open_orders(self) -> List[Any]:
+        return self.get_open_orders()
+
+    def cancel_open_orders(self) -> None:
+        self._trading.cancel_orders()

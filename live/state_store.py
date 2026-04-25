@@ -10,6 +10,8 @@ DEFAULT_STATE: Dict[str, Any] = {
     "last_successful_run_ts": None,
     "last_target_symbols": [],
     "last_mode": None,
+    "last_cycle_key": None,
+    "first_run_liquidation_done": False,
 }
 
 
