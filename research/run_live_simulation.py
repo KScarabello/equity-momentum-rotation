@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Live-style day-by-day execution simulation for the validated momentum strategy.
+Live-style day-by-day execution simulation for the equity momentum strategy.
 
 This runner intentionally reuses existing strategy logic (signals, market filter,
 rebalance cadence, and execution friction assumptions) while simulating portfolio
@@ -33,9 +33,9 @@ from research.walk_forward_momentum import (
 
 STOOQ_DIR = Path("data_cache/stooq")
 
-# Validated baseline defaults.
+# Example configuration defaults.
 # Include both legacy risk_off_exposure and the current exposure controls so
-# behavior is explicit and aligned with the already-validated setup.
+# behavior is explicit and aligned with the example setup.
 BASE_CFG = dict(
     positions=12,
     rebalance_interval_weeks=2,

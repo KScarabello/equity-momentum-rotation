@@ -3,7 +3,7 @@
 Run a dynamic exposure sweep for the equity momentum strategy.
 
 Tests whether smoothly scaling portfolio exposure based on the market's
-distance above its SMA improves CAGR, Sharpe, and max drawdown versus
+distance above its SMA affects return, risk, and drawdown compared to
 fixed exposure levels.
 
 Run:
@@ -100,7 +100,7 @@ def _summarize_equity_curve(equity_oos: pd.Series) -> dict[str, float]:
 
 
 def main() -> None:
-    # Baseline fixed settings (best from prior sweeps)
+    # Reference settings for comparison.
     BASE_CFG = dict(
         positions=12,
         rebalance_interval_weeks=2,

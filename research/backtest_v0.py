@@ -4,7 +4,7 @@ Minimal equity momentum rotation backtest.
 Research sanity-check, not production code.
 - Equal weight across selected holdings
 - Rebalance every N trading days (from config)
-- Momentum = 12-1 style (from research.momentum helpers)
+- Momentum = multi-period style (from research.momentum helpers)
 - Optional absolute momentum filter (from config)
 - Optional simple transaction cost model applied on rebalance days
 - Rebalance happens at CLOSE; new holdings apply NEXT trading day (more realistic)

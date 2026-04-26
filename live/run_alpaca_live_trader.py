@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Production-safe Alpaca live runner for the validated momentum strategy.
+Production-safe Alpaca live runner for the equity momentum strategy.
 
 Run:
     python3 -m live.run_alpaca_live_trader --dry-run --verbose

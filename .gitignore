@@ -8,16 +8,19 @@ __pycache__/
 .env
 .env.*
 !.env.example
+config_private.py
 .venv/
 venv/
 
 # Data
 data_cache/
 *.parquet
+outputs/
 
 # Logs
 logs/
 *.log
+live/alpaca_live_state.json
 
 # Generated research outputs
 comparison_strategy_vs_spy*.csv

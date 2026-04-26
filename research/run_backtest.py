@@ -54,7 +54,7 @@ def main() -> None:
 
     prices_all = prices_all.sort_index().ffill(limit=3)
 
-    # --- Enforce locked universe ---
+    # --- Apply configured universe ---
     present = set(prices_all.columns)
     required = LOCKED_SYMBOLS
     missing = required - present
@@ -117,7 +117,7 @@ def main() -> None:
     print("=" * 60)
     print("QUICK COMPARISON")
     print("=" * 60)
-    print(f"Strategy CAGR - SPY CAGR:     {excess_cagr*100:.2f}%")
+    print(f"Strategy CAGR - benchmark CAGR: {excess_cagr*100:.2f}%")
     print("Note: This is not a full alpha model (no factor regression),")
     print("but it tells us whether we're plausibly beating SPY net of costs.")
     print("=" * 60)

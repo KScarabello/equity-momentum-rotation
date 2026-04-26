@@ -22,7 +22,7 @@ def compute_12_1_momentum(
     min_price: float = 5.0,
 ) -> pd.Series:
     """
-    12-1 momentum:
+    Multi-period momentum (lookback with optional skip):
       end = price at (t - skip_recent_months)
       start = price at (t - skip_recent_months - lookback_months)
 

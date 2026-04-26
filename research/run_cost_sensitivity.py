@@ -2,7 +2,7 @@
 """
 Run cost sensitivity analysis for the walk-forward momentum strategy.
 
-This script varies only cost_bps while keeping all other baseline settings fixed.
+This script varies only cost_bps while keeping all other reference settings fixed.
 It reuses the existing walk-forward pipeline and evaluates in-memory OOS equity.
 
 Run:
@@ -25,7 +25,7 @@ OUT_CSV = Path("research/cost_sensitivity_results.csv")
 
 
 def _build_baseline_cfg(cost_bps: int) -> WalkForwardConfig:
-    # Baseline locked settings, varying only cost_bps.
+    # Reference settings, varying only cost_bps.
     return WalkForwardConfig(
         train_years=3,
         test_months=6,

@@ -1,26 +1,26 @@
 strategy:
-  name: "Alpha v1 - Equity Momentum Rotation"
+  name: "Example Equity Momentum Strategy"
   version: "1.0"
   description: >
-    Simple equity momentum rotation.
-    Selects top-ranked U.S. equities using 12–1 momentum,
-    rebalanced every N trading days.
+    Simple equity momentum rotation strategy example.
+    Selects top-ranked U.S. equities using multi-period momentum,
+    rebalanced on a fixed interval.
 
 universe:
   type: "equities"
   region: "US"
-  universe_source: "sp500"
-  max_universe_size: 150
+  universe_source: "example_universe"
+  max_universe_size: 500
 
   filters:
-    min_average_daily_dollar_volume: 10000000
+    min_average_daily_dollar_volume: 5000000
     min_price: 5.0
 
 signal:
   type: "momentum"
   momentum:
-    lookback_months: 12
-    skip_recent_months: 1
+    lookback_months: 6
+    skip_recent_months: 0
     ranking: "descending"
 
     absolute_momentum_filter:
@@ -30,15 +30,15 @@ signal:
 
 portfolio:
   selection_method: "top_n"
-  top_n: 10
+  top_n: 5
   weighting:
     method: "equal"
 
 rebalance:
-  frequency: "biweekly"
-  trading_days_interval: 10
+  frequency: "monthly"
+  trading_days_interval: 21
   rebalance_on_close: true
 
 execution:
-  slippage_bps: 5
-  commission_bps: 1
+  slippage_bps: 10
+  commission_bps: 5

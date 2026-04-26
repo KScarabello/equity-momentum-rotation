@@ -6,16 +6,26 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from config.strategy_public_defaults import PUBLIC_STRATEGY_DEFAULTS
 from research.walk_forward_momentum import WalkForwardConfig
 
 
-# Strategy baseline (locked)
-BASELINE_POSITIONS = 12
-BASELINE_REBALANCE_INTERVAL_WEEKS = 3  # ~15 trading days
-BASELINE_W_3M = 0.60
-BASELINE_W_6M = 0.30
-BASELINE_W_12M = 0.10
-BASELINE_COST_BPS = 5.0
+def _load_private_strategy_overrides() -> dict[str, object]:
+    """Load optional local-only strategy overrides from config_private.py."""
+    try:
+        from config_private import STRATEGY_PRIVATE_OVERRIDES  # type: ignore
+    except ModuleNotFoundError:
+        return {}
+
+    if not isinstance(STRATEGY_PRIVATE_OVERRIDES, dict):
+        raise ValueError("STRATEGY_PRIVATE_OVERRIDES must be a dict if provided.")
+    return dict(STRATEGY_PRIVATE_OVERRIDES)
+
+
+def _build_strategy_defaults() -> dict[str, object]:
+    cfg = dict(PUBLIC_STRATEGY_DEFAULTS)
+    cfg.update(_load_private_strategy_overrides())
+    return cfg
 
 
 @dataclass(frozen=True)
@@ -49,7 +59,7 @@ class LiveTradingConfig:
     # Trade filters / risk controls
     min_trade_notional: float = 10.0
     max_deployment_pct: float = 0.60
-    max_positions: int = BASELINE_POSITIONS
+    max_positions: int = int(PUBLIC_STRATEGY_DEFAULTS.get("positions", 8))
     max_order_count: int = 40
     min_sell_qty: float = 0.000001
     max_position_weight_tolerance: float = 0.03
@@ -99,6 +109,8 @@ def _env_time(name: str, default: time) -> time:
 
 
 def load_live_trading_config() -> LiveTradingConfig:
+    strat_defaults = _build_strategy_defaults()
+
     cfg = LiveTradingConfig(
         alpaca_api_key=os.getenv("ALPACA_API_KEY", "").strip(),
         alpaca_secret_key=os.getenv("ALPACA_SECRET_KEY", "").strip(),
@@ -117,7 +129,7 @@ def load_live_trading_config() -> LiveTradingConfig:
         time_in_force=os.getenv("TIME_IN_FORCE", "day").strip().lower() or "day",
         min_trade_notional=_env_float("MIN_TRADE_NOTIONAL", 10.0),
         max_deployment_pct=_env_float("MAX_DEPLOYMENT_PCT", 0.60),
-        max_positions=_env_int("MAX_POSITIONS", BASELINE_POSITIONS),
+        max_positions=_env_int("MAX_POSITIONS", int(strat_defaults.get("positions", 8))),
         max_order_count=_env_int("MAX_ORDER_COUNT", 40),
         min_sell_qty=_env_float("MIN_SELL_QTY", 0.000001),
     )
@@ -135,37 +147,4 @@ def load_live_trading_config() -> LiveTradingConfig:
 
 
 def build_baseline_cfg() -> WalkForwardConfig:
-    return WalkForwardConfig(
-        train_years=3,
-        test_months=6,
-        step_months=6,
-        positions=BASELINE_POSITIONS,
-        universe_top_n=800,
-        rebalance_weekday=0,
-        rebalance_interval_weeks=BASELINE_REBALANCE_INTERVAL_WEEKS,
-        starting_cash=100_000.0,
-        liq_lookback=60,
-        mom_3m=63,
-        mom_6m=126,
-        mom_12m=252,
-        w_3m=BASELINE_W_3M,
-        w_6m=BASELINE_W_6M,
-        w_12m=BASELINE_W_12M,
-        use_strength_filter=False,
-        percentile_filter_enabled=False,
-        market_filter_mode="none",
-        momentum_effectiveness_skip_threshold=None,
-        veto_if_12m_return_below=0.0,
-        market_symbol="SPY",
-        market_sma_days=200,
-        risk_on_buffer=0.0,
-        cost_bps=BASELINE_COST_BPS,
-        slippage_bps=2.0,
-        min_exposure=0.25,
-        max_exposure=1.0,
-        exposure_slope=0.0,
-        require_positive_sma_slope=True,
-        sma_slope_lookback=20,
-        stability_lookback_periods=1,
-        min_rebalance_weight_change=0.0,
-    )
+    return WalkForwardConfig(**_build_strategy_defaults())

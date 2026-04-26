@@ -1,25 +1,22 @@
-# Equity Momentum Rotation (12–1)
+# Equity Momentum Rotation
 
-This repository contains a research backtest of a classic 12–1 equity momentum
+This repository contains a research backtest of an equity momentum
 strategy, evaluated on historical U.S. equity data (Stooq) and benchmarked
-against SPY buy-and-hold.
+against a buy-and-hold benchmark.
 
 ## Strategy
 
-- Signal: 12–1 momentum (12-month lookback, 1-month skip)
+- Signal: Multi-period momentum (configurable lookback windows)
 - Universe: U.S. equities (Stooq parquet cache)
 - Portfolio: Top-N ranked equities, equal-weighted
 - Rebalance: Every N trading days (biweekly by default)
 - Costs: Applied on rebalance days, proportional to turnover
 - Risk-off: Optional absolute momentum filter
 
-## Results (2009–2025)
+## Performance
 
-- Strategy CAGR: ~21%
-- SPY CAGR: ~14%
-- Excess return: ~7% annualized
-- Sharpe: Higher than SPY
-- Drawdown: Comparable
+Results vary based on configuration, universe, and time period.
+Run `python -m research.run_backtest` to generate metrics for your local data.
 
 ## Correctness Guarantees
 

@@ -2,7 +2,7 @@
 """
 Robustness suite for the equity momentum strategy.
 
-Tests small perturbations around the validated baseline to determine whether
+Tests small perturbations around the reference configuration to determine whether
 the strategy is stable, moderately sensitive, or fragile.
 
 Groups:

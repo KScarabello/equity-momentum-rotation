@@ -2,7 +2,7 @@
 """
 Run regime breakdown analysis for the walk-forward momentum strategy.
 
-This script keeps baseline strategy settings fixed and analyzes OOS performance
+This script keeps reference strategy settings fixed and analyzes OOS performance
 across calendar segments, rolling windows, and SPY-defined market regimes.
 
 Run:

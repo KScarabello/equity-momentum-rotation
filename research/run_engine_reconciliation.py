@@ -22,7 +22,7 @@ from research.walk_forward_momentum import (
     _ensure_datetime_index,
 )
 
-# Baseline configuration (validated).
+# Reference configuration.
 BASE_CFG = dict(
     positions=12,
     rebalance_interval_weeks=2,

@@ -9,7 +9,7 @@ Assumptions:
 - You already have:
   - research.backtest_v0.backtest_rotation_v0(prices, config_path=..., cost_bps=...)
   - research.data_stooq.load_stooq_price_matrix(...)
-- Your config file is config/alpha_v1.yaml (baseline params).
+- Your config file is config/alpha_v1.yaml (reference configuration).
 
 Design:
 - We *do not* mutate your YAML on disk.

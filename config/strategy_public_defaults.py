@@ -1,0 +1,38 @@
+from __future__ import annotations
+
+# Public-safe demo defaults only.
+# These values are intentionally generic and safe to publish.
+PUBLIC_STRATEGY_DEFAULTS: dict[str, object] = {
+    "train_years": 3,
+    "test_months": 6,
+    "step_months": 6,
+    "positions": 10,
+    "universe_top_n": 300,
+    "rebalance_weekday": 0,
+    "rebalance_interval_weeks": 4,
+    "starting_cash": 100_000.0,
+    "liq_lookback": 60,
+    "mom_3m": 60,
+    "mom_6m": 120,
+    "mom_12m": 240,
+    "w_3m": 0.34,
+    "w_6m": 0.33,
+    "w_12m": 0.33,
+    "use_strength_filter": False,
+    "percentile_filter_enabled": False,
+    "market_filter_mode": "none",
+    "momentum_effectiveness_skip_threshold": None,
+    "veto_if_12m_return_below": 0.0,
+    "market_symbol": "BENCHMARK",
+    "market_sma_days": 200,
+    "risk_on_buffer": 0.0,
+    "cost_bps": 10.0,
+    "slippage_bps": 2.0,
+    "min_exposure": 0.25,
+    "max_exposure": 1.0,
+    "exposure_slope": 0.0,
+    "require_positive_sma_slope": True,
+    "sma_slope_lookback": 20,
+    "stability_lookback_periods": 1,
+    "min_rebalance_weight_change": 0.0,
+}
