@@ -18,6 +18,22 @@ against a buy-and-hold benchmark.
 Results vary based on configuration, universe, and time period.
 Run `python -m research.run_backtest` to generate metrics for your local data.
 
+To compare same-close execution versus a more realistic `close[t] -> open[t+1]`
+execution assumption on the walk-forward engine, run:
+
+```bash
+python -m research.run_execution_timing_comparison
+```
+
+Then regenerate weighted execution-gap impact analysis from the diagnostics CSV:
+
+```bash
+python -m research.analyze_execution_gap_impact
+```
+
+This writes comparison outputs under `research/` and requires Stooq parquet files
+that preserve daily `Open`, `Close`, and `Volume` columns.
+
 ## Correctness Guarantees
 
 This project includes unit tests that lock:

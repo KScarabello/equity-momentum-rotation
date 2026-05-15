@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import Decimal, ROUND_HALF_UP
+import math
 from typing import Any, Dict, Iterable, List, Optional
 
 
@@ -47,6 +49,17 @@ class AlpacaCredentials:
     api_key: str
     secret_key: str
     base_url: str
+
+
+def round_alpaca_limit_price(price: float) -> float:
+    value = float(price)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"limit price must be positive, got {price}")
+
+    decimals = 2 if value >= 1.0 else 4
+    quantizer = Decimal("1").scaleb(-decimals)
+    rounded = Decimal(str(value)).quantize(quantizer, rounding=ROUND_HALF_UP)
+    return float(rounded)
 
 
 class AlpacaBroker:
@@ -113,8 +126,8 @@ class AlpacaBroker:
             raise ValueError("qty must be positive")
         if notional is not None and float(notional) <= 0:
             raise ValueError("notional must be positive")
-        if float(limit_price) <= 0:
-            raise ValueError("limit_price must be positive")
+
+        limit_price = round_alpaca_limit_price(limit_price)
 
         order_side = self._m["OrderSide"].BUY if side == "buy" else self._m["OrderSide"].SELL
         tif_value = self._m["TimeInForce"].DAY if tif.lower() == "day" else self._m["TimeInForce"].GTC
@@ -123,7 +136,7 @@ class AlpacaBroker:
             "symbol": symbol,
             "side": order_side,
             "time_in_force": tif_value,
-            "limit_price": round(float(limit_price), 4),
+            "limit_price": limit_price,
             "client_order_id": client_order_id,
         }
         if qty is not None:
@@ -183,7 +196,7 @@ class AlpacaBroker:
         tif_value = self._m["TimeInForce"].DAY if tif.lower() == "day" else self._m["TimeInForce"].GTC
         req = self._m["ClosePositionRequest"](
             qty=round(float(qty), 6),
-            limit_price=round(float(limit_price), 4),
+            limit_price=round_alpaca_limit_price(limit_price),
             time_in_force=tif_value,
             client_order_id=client_order_id,
         )

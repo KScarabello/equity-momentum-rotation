@@ -20,6 +20,7 @@ class WalkForwardConfig:
     universe_top_n: int = 800  # top liquid stocks by $ volume
     rebalance_weekday: int = 0  # 0=Mon ... 4=Fri (weekly rebalance anchor)
     rebalance_interval_weeks: int = 2  # 1 = weekly (default), 2 = biweekly, etc.
+    execution_price: str = "close"  # "close" = execute on decision close, "next_open" = execute on next trading day open
     min_rebalance_weight_change: float = 0.0
     starting_cash: float = 100_000.0
     stability_lookback_periods: int = 1  # 1 = no filter; N = stock must appear in top positions*2 for last N rebalances
@@ -75,6 +76,12 @@ class WalkForwardConfig:
     momentum_effectiveness_lookback: int = 63  # bars used to evaluate whether momentum has recently worked
     momentum_effectiveness_skip_threshold: Optional[float] = 0.0  # skip when effectiveness < threshold; None disables effectiveness skip
 
+    def __post_init__(self) -> None:
+        if self.execution_price not in {"close", "next_open"}:
+            raise ValueError(
+                f"Unsupported execution_price={self.execution_price!r}; expected 'close' or 'next_open'"
+            )
+
 
 
 
@@ -127,6 +134,12 @@ def _get_close(df: pd.DataFrame) -> pd.Series:
     if "close" not in df.columns:
         raise ValueError("DataFrame must contain 'close' column")
     return df["close"]
+
+
+def _get_open(df: pd.DataFrame) -> pd.Series:
+    if "open" not in df.columns:
+        raise ValueError("DataFrame must contain 'open' column")
+    return df["open"]
 
 
 def _get_volume(df: pd.DataFrame) -> pd.Series:
@@ -400,6 +413,36 @@ class WindowResult:
     ending_cash: float = 0.0
     ending_holdings: Dict[str, float] = field(default_factory=dict)
     non_zero_exposure_days: int = 0
+    gap_records: List[Dict[str, object]] = field(default_factory=list)
+    skipped_execution_symbols: int = 0
+    skipped_execution_rebalances: int = 0
+
+
+def _next_trading_date(cal: pd.DatetimeIndex, dt: pd.Timestamp) -> Optional[pd.Timestamp]:
+    loc = cal.get_loc(dt)
+    if isinstance(loc, slice):
+        idx = loc.start
+    elif isinstance(loc, np.ndarray):
+        idx = int(loc[0]) if len(loc) else -1
+    else:
+        idx = int(loc)
+    if idx < 0 or idx + 1 >= len(cal):
+        return None
+    return pd.Timestamp(cal[idx + 1])
+
+
+def _latest_price_at_or_before(series: pd.Series, dt: pd.Timestamp) -> float:
+    hist = series.loc[:dt]
+    if len(hist) == 0:
+        return np.nan
+    return float(hist.iloc[-1])
+
+
+def _latest_price_before(series: pd.Series, dt: pd.Timestamp) -> float:
+    hist = series.loc[series.index < dt]
+    if len(hist) == 0:
+        return np.nan
+    return float(hist.iloc[-1])
 
 
 def run_weekly_portfolio(
@@ -449,7 +492,16 @@ def run_weekly_portfolio(
 
     # Precompute close series access
     closes: Dict[str, pd.Series] = {s: _get_close(df) for s, df in symbol_dfs.items()}
-    mclose = _get_close(market_df)
+    opens: Dict[str, pd.Series] = {}
+    if cfg.execution_price == "next_open":
+        missing_open_cols = [sym for sym, df in symbol_dfs.items() if "open" not in df.columns]
+        if missing_open_cols:
+            sample = ", ".join(sorted(missing_open_cols)[:10])
+            raise ValueError(
+                "next_open execution requires an 'open' column for every symbol frame; "
+                f"missing for {len(missing_open_cols)} symbols: {sample}"
+            )
+        opens = {s: _get_open(df) for s, df in symbol_dfs.items()}
 
     def portfolio_value(on_date: pd.Timestamp) -> float:
         v = cash
@@ -464,6 +516,32 @@ def run_weekly_portfolio(
             )
             if np.isfinite(px):
                 v += sh * float(px)
+        return float(v)
+
+    def execution_price_for_symbol(sym: str, execution_date: pd.Timestamp) -> float:
+        if cfg.execution_price == "close":
+            return _latest_price_at_or_before(closes[sym], execution_date)
+
+        os = opens.get(sym)
+        if os is None or execution_date not in os.index:
+            return np.nan
+        px = float(os.loc[execution_date])
+        return px if np.isfinite(px) and px > 0 else np.nan
+
+    def execution_mark_price(sym: str, execution_date: pd.Timestamp) -> float:
+        px = execution_price_for_symbol(sym, execution_date)
+        if np.isfinite(px):
+            return float(px)
+        return _latest_price_before(closes[sym], execution_date)
+
+    def portfolio_value_for_execution(execution_date: pd.Timestamp) -> float:
+        v = float(cash)
+        for sym, sh in holdings.items():
+            if sym not in closes:
+                continue
+            px = execution_mark_price(sym, execution_date)
+            if np.isfinite(px):
+                v += float(sh) * float(px)
         return float(v)
 
     def liquid_universe(asof: pd.Timestamp) -> List[str]:
@@ -579,8 +657,345 @@ def run_weekly_portfolio(
     # Each entry is a set of symbols that were in the top positions*2 at that rebalance
     ranking_history: List[set] = []
     stability_window = cfg.stability_lookback_periods  # alias for clarity
+    pending_rebalance: Optional[Dict[str, object]] = None
+    gap_records: List[Dict[str, object]] = []
+    skipped_execution_symbols = 0
+    skipped_execution_rebalances = 0
+
+    def build_rebalance_decision(
+        decision_date: pd.Timestamp,
+        choppy_override: bool,
+        momentum_effectiveness: Optional[float],
+    ) -> Dict[str, object]:
+        nonlocal ranking_history
+
+        decision = compute_rebalance_target(
+            symbol_dfs=symbol_dfs,
+            market_df=market_df,
+            asof=decision_date,
+            cfg=cfg,
+            ranking_history=ranking_history,
+        )
+        ranking_history = decision["ranking_history"]
+
+        target_exposure = float(decision["target_exposure"])
+        if choppy_override:
+            target_exposure = min(target_exposure, cfg.choppy_reduce_exposure)
+
+        return {
+            "decision_date": pd.Timestamp(decision_date),
+            "execution_date": pd.Timestamp(decision_date),
+            "risk_on": bool(decision["risk_on"]),
+            "target_exposure": float(target_exposure),
+            "eligible_count": int(decision["eligible_count"]),
+            "selected_symbols": list(decision["selected_symbols"]),
+            "target_weights": dict(decision["target_weights"]),
+            "choppy_override": bool(choppy_override),
+            "momentum_effectiveness": (
+                float(momentum_effectiveness)
+                if momentum_effectiveness is not None and np.isfinite(momentum_effectiveness)
+                else np.nan
+            ),
+        }
+
+    def execute_rebalance(decision: Dict[str, object]) -> None:
+        nonlocal cash
+        nonlocal holdings
+        nonlocal trades
+        nonlocal total_turnover
+        nonlocal total_costs_dollar
+        nonlocal skipped_execution_symbols
+        nonlocal skipped_execution_rebalances
+
+        decision_date = pd.Timestamp(decision["decision_date"])
+        execution_date = pd.Timestamp(decision["execution_date"])
+        risk_on = bool(decision["risk_on"])
+        target_portfolio_fraction = float(decision["target_exposure"])
+        picks = list(decision["selected_symbols"])
+        target_weights = dict(decision["target_weights"])
+        eligible_count = int(decision["eligible_count"])
+        momentum_effectiveness = decision["momentum_effectiveness"]
+        choppy_override = bool(decision["choppy_override"])
+
+        pv = portfolio_value_for_execution(execution_date)
+        holdings_before = {sym: float(sh) for sym, sh in holdings.items()}
+        holdings_signature_before = holdings_signature_str()
+        cash_before = float(cash)
+
+        current_values = {
+            sym: float(sh) * float(execution_mark_price(sym, execution_date))
+            for sym, sh in holdings.items()
+            if np.isfinite(execution_mark_price(sym, execution_date))
+        }
+        gap_rows: List[Dict[str, object]] = []
+
+        def append_gap_row(
+            sym: str,
+            action: str,
+            target_weight: float,
+            close_px: float,
+            exec_px: float,
+            traded_notional_symbol: float,
+        ) -> None:
+            gap_rows.append(
+                {
+                    "decision_date": decision_date,
+                    "execution_date": execution_date,
+                    "symbol": sym,
+                    "close_t": float(close_px) if np.isfinite(close_px) else np.nan,
+                    "execution_price": float(exec_px) if np.isfinite(exec_px) else np.nan,
+                    "overnight_gap_return": (
+                        float(exec_px) / float(close_px) - 1.0
+                        if np.isfinite(exec_px)
+                        and np.isfinite(close_px)
+                        and close_px > 0
+                        and cfg.execution_price == "next_open"
+                        else np.nan
+                    ),
+                    "action": action,
+                    "target_weight": float(target_weight),
+                    "traded_notional_symbol": float(abs(traded_notional_symbol)),
+                }
+            )
+
+        traded_notional = 0.0
+        cost = 0.0
+        slippage_cost = 0.0
+        rebal_to = 0.0
+        skipped_this_rebalance = 0
+
+        if not risk_on and cfg.min_exposure == 0.0:
+            if holdings:
+                for sym in list(holdings.keys()):
+                    exec_px = execution_price_for_symbol(sym, execution_date)
+                    close_px = _latest_price_at_or_before(closes[sym], decision_date)
+                    if not np.isfinite(exec_px):
+                        skipped_this_rebalance += 1
+                        append_gap_row(
+                            sym=sym,
+                            action="skipped",
+                            target_weight=0.0,
+                            close_px=close_px,
+                            exec_px=np.nan,
+                            traded_notional_symbol=0.0,
+                        )
+                        continue
+
+                    held_value = float(holdings[sym]) * float(exec_px)
+                    traded_notional += abs(held_value)
+                    trades += 1
+                    append_gap_row(
+                        sym=sym,
+                        action="sold",
+                        target_weight=0.0,
+                        close_px=close_px,
+                        exec_px=exec_px,
+                        traded_notional_symbol=held_value,
+                    )
+                    del holdings[sym]
+
+                if pv > 0:
+                    rebal_to = traded_notional / pv
+                    total_turnover += rebal_to
+                turnover_per_rebalance.append(rebal_to)
+                slippage_cost = traded_notional * (cfg.slippage_bps / 10_000.0)
+                total_costs_dollar += slippage_cost
+                cash = pv - slippage_cost
+            else:
+                turnover_per_rebalance.append(0.0)
+                cash = pv
+        else:
+            target_values = {
+                sym: pv * target_portfolio_fraction * float(target_weights.get(sym, 0.0))
+                for sym in picks
+            }
+
+            executed_actions: Dict[str, str] = {}
+
+            for sym in list(holdings.keys()):
+                exec_px = execution_price_for_symbol(sym, execution_date)
+                close_px = _latest_price_at_or_before(closes[sym], decision_date)
+                cur_val = current_values.get(sym, 0.0)
+                target_weight = float(target_weights.get(sym, 0.0))
+
+                if sym not in target_values:
+                    if not np.isfinite(exec_px):
+                        skipped_this_rebalance += 1
+                        executed_actions[sym] = "skipped"
+                        append_gap_row(
+                            sym=sym,
+                            action="skipped",
+                            target_weight=0.0,
+                            close_px=close_px,
+                            exec_px=np.nan,
+                            traded_notional_symbol=0.0,
+                        )
+                        continue
+
+                    traded_notional += abs(cur_val)
+                    trades += 1
+                    del holdings[sym]
+                    executed_actions[sym] = "sold"
+                    append_gap_row(
+                        sym=sym,
+                        action="sold",
+                        target_weight=target_weight,
+                        close_px=close_px,
+                        exec_px=exec_px,
+                        traded_notional_symbol=cur_val,
+                    )
+
+            for sym in picks:
+                exec_px = execution_price_for_symbol(sym, execution_date)
+                close_px = _latest_price_at_or_before(closes[sym], decision_date)
+                cur_val = current_values.get(sym, 0.0)
+                target_weight = float(target_weights.get(sym, 0.0))
+
+                if not np.isfinite(exec_px):
+                    skipped_this_rebalance += 1
+                    executed_actions[sym] = "skipped"
+                    append_gap_row(
+                        sym=sym,
+                        action="skipped",
+                        target_weight=target_weight,
+                        close_px=close_px,
+                        exec_px=np.nan,
+                        traded_notional_symbol=0.0,
+                    )
+                    continue
+
+                tval = target_values[sym]
+                diff = tval - cur_val
+
+                if sym in current_values:
+                    current_weight = (cur_val / pv) if pv > 0 else 0.0
+                    if abs(target_weight - current_weight) < cfg.min_rebalance_weight_change:
+                        executed_actions[sym] = "held"
+                        append_gap_row(
+                            sym=sym,
+                            action="held",
+                            target_weight=target_weight,
+                            close_px=close_px,
+                            exec_px=exec_px,
+                            traded_notional_symbol=0.0,
+                        )
+                        continue
+
+                if abs(diff) / max(pv, 1e-9) < 1e-4:
+                    executed_actions[sym] = "held"
+                    append_gap_row(
+                        sym=sym,
+                        action="held",
+                        target_weight=target_weight,
+                        close_px=close_px,
+                        exec_px=exec_px,
+                        traded_notional_symbol=0.0,
+                    )
+                    continue
+
+                dsh = diff / float(exec_px)
+                holdings[sym] = holdings.get(sym, 0.0) + dsh
+                traded_notional += abs(diff)
+                trades += 1
+
+                new_val = float(holdings[sym]) * float(exec_px)
+                action = "bought" if diff > 0 else "sold"
+                executed_actions[sym] = action
+                append_gap_row(
+                    sym=sym,
+                    action=action,
+                    target_weight=target_weight,
+                    close_px=close_px,
+                    exec_px=exec_px,
+                    traded_notional_symbol=diff,
+                )
+
+            cost = traded_notional * (cfg.cost_bps / 10_000.0)
+            slippage_cost = traded_notional * (cfg.slippage_bps / 10_000.0)
+            total_costs_dollar += cost + slippage_cost
+
+            invested_after = 0.0
+            for sym, sh in holdings.items():
+                mark_px = execution_mark_price(sym, execution_date)
+                if np.isfinite(mark_px):
+                    invested_after += float(sh) * float(mark_px)
+
+            cash = pv - invested_after - cost - slippage_cost
+            rebal_to = traded_notional / pv if pv > 0 else 0.0
+            turnover_per_rebalance.append(rebal_to)
+            total_turnover += rebal_to
+
+        skipped_execution_symbols += skipped_this_rebalance
+        if skipped_this_rebalance > 0:
+            skipped_execution_rebalances += 1
+
+        invested_after_trade = 0.0
+        for sym, sh in holdings.items():
+            mark_px = execution_mark_price(sym, execution_date)
+            if np.isfinite(mark_px):
+                invested_after_trade += float(sh) * float(mark_px)
+        pv_after_trade = float(cash + invested_after_trade)
+
+        for row in gap_rows:
+            sym = str(row["symbol"])
+            pre_val = float(current_values.get(sym, 0.0))
+            pre_weight = (pre_val / pv) if pv > 0 else np.nan
+
+            mark_px = execution_mark_price(sym, execution_date)
+            if sym in holdings and np.isfinite(mark_px):
+                post_val = float(holdings[sym]) * float(mark_px)
+            else:
+                post_val = 0.0
+            post_weight = (post_val / pv_after_trade) if pv_after_trade > 0 else np.nan
+
+            traded_notional_symbol = float(row.get("traded_notional_symbol", 0.0))
+            row["executed_weight"] = float(post_weight) if np.isfinite(post_weight) else np.nan
+            row["pre_trade_weight"] = float(pre_weight) if np.isfinite(pre_weight) else np.nan
+            row["post_trade_weight"] = float(post_weight) if np.isfinite(post_weight) else np.nan
+            row["trade_weight_change"] = (
+                float(post_weight - pre_weight)
+                if np.isfinite(pre_weight) and np.isfinite(post_weight)
+                else np.nan
+            )
+            row["traded_notional_pct"] = (
+                float(abs(traded_notional_symbol) / pv) if pv > 0 else np.nan
+            )
+            gap_records.append(row)
+
+        pv_after_close = portfolio_value(execution_date)
+        rebalance_records.append(
+            {
+                "rebalance_date": decision_date,
+                "decision_date": decision_date,
+                "execution_date": execution_date,
+                "execution_price": cfg.execution_price,
+                "choppy_override": choppy_override,
+                "skip_reason": "",
+                "momentum_effectiveness": momentum_effectiveness,
+                "risk_on": bool(risk_on),
+                "target_exposure": float(target_portfolio_fraction),
+                "eligible_count": int(eligible_count),
+                "selected_symbols": "|".join(picks),
+                "holdings_count_before": int(len(holdings_before)),
+                "holdings_count_after": int(len(holdings)),
+                "holdings_signature_before": holdings_signature_before,
+                "holdings_signature_after": holdings_signature_str(),
+                "cash_before": cash_before,
+                "cash_after": float(cash),
+                "turnover": float(rebal_to),
+                "estimated_cost": float(cost),
+                "estimated_slippage": float(slippage_cost),
+                "equity_before_rebalance": float(pv),
+                "equity_after_rebalance": float(pv_after_close),
+                "skipped_execution_symbols": int(skipped_this_rebalance),
+            }
+        )
 
     for i, dt in enumerate(cal):
+        if pending_rebalance is not None and pd.Timestamp(pending_rebalance["execution_date"]) == dt:
+            execute_rebalance(pending_rebalance)
+            pending_rebalance = None
+
         # Choppy-market skip gate — evaluated before any rebalance execution.
         _is_rebalance = dt in rebals
         # _is_choppy_on_this_date: computed once per rebalance date; shared by both skip and
@@ -626,6 +1041,13 @@ def run_weekly_portfolio(
             rebalance_records.append(
                 {
                     "rebalance_date": dt,
+                    "decision_date": dt,
+                    "execution_date": (
+                        _next_trading_date(cal, dt)
+                        if cfg.execution_price == "next_open"
+                        else dt
+                    ),
+                    "execution_price": cfg.execution_price,
                     "skipped": True,
                     "choppy_override": False,
                     "skip_reason": _skip_reason,
@@ -648,199 +1070,67 @@ def run_weekly_portfolio(
                     "estimated_slippage": 0.0,
                     "equity_before_rebalance": float(_pv_s),
                     "equity_after_rebalance": float(_pv_s),
+                    "skipped_execution_symbols": 0,
                 }
             )
         # Execute rebalance if it is scheduled AND not blocked by the market-quality gate.
         if _is_rebalance and not _skip_this:
-            # Mark-to-market before rebalance
-            pv = portfolio_value(dt)
-            risk_on = market_risk_on(market_df, dt, cfg)
-            target_portfolio_fraction = compute_market_exposure(market_df, dt, cfg, risk_on)
             # Choppy-regime exposure scaling: override target fraction downward when choppy.
             _choppy_override = (
                 cfg.market_filter_mode == "choppy_filter_reduce_exposure"
                 and _is_choppy_on_this_date
             )
-            if _choppy_override:
-                target_portfolio_fraction = min(target_portfolio_fraction, cfg.choppy_reduce_exposure)
-            picks: List[str] = []
-            eligible_count = 0
-            traded_notional = 0.0
-            cost = 0.0
-            slippage_cost = 0.0
-
-            if not risk_on and cfg.min_exposure == 0.0:
-                # Original behavior: go fully to cash
-                if holdings:
-                    held_value = pv - cash  # dollar value of all open positions
-                    traded_notional = abs(held_value)
-                    if pv > 0:
-                        to = abs(held_value) / pv
-                        total_turnover += to
-                        turnover_per_rebalance.append(to)
-                    # Slippage on forced liquidation: selling receives less
-                    slip_cost = abs(held_value) * (cfg.slippage_bps / 10_000.0)
-                    slippage_cost = slip_cost
-                    total_costs_dollar += slip_cost
-                    trades += len(holdings)
-                    cash = pv - slip_cost
-                else:
-                    # Already in cash — no trades, record 0-turnover rebalance
-                    turnover_per_rebalance.append(0.0)
-                    cash = pv
-                holdings = {}
-            else:
-                # Partial-exposure risk-off OR fully risk-on path.
-                # Dynamic exposure: step function (slope=0) or smooth ramp (slope>0) above SMA.
-                # Risk-off with min_exposure>0 uses min_exposure as the floor.
-                # Build tradable set
-                uni = liquid_universe(dt)
-
-                # Score momentum for universe
-                scored = []
-                for sym in uni:
-                    sc = momentum_score(symbol_dfs[sym], dt, cfg)
-                    if sc is not None and np.isfinite(sc):
-                        scored.append((sym, sc))
-
-                scored.sort(key=lambda x: x[1], reverse=True)
-
-                # Optional strength filter: keep only names with genuinely positive momentum.
-                if cfg.use_strength_filter:
-                    scored = [(s, sc) for s, sc in scored if sc > 0.0]
-
-                # Optional percentile filter: keep scores in the top cross-sectional percentile.
-                if cfg.percentile_filter_enabled and scored:
-                    threshold = float(np.quantile([sc for _, sc in scored], cfg.percentile_threshold))
-                    scored = [(s, sc) for s, sc in scored if sc >= threshold]
-
-                eligible_count = len(scored)
-
-                # Build top-2x candidate set and record for stability history
-                top_pool_size = cfg.positions * 2
-                top_pool = {s for s, _ in scored[:top_pool_size]}
-                ranking_history.append(top_pool)
-                if len(ranking_history) > stability_window:
-                    ranking_history.pop(0)
-
-                # Stability filter: keep only stocks that appeared in ALL recent top pools
-                if stability_window > 1 and len(ranking_history) >= stability_window:
-                    stable = [
-                        (s, sc) for s, sc in scored
-                        if all(s in h for h in ranking_history)
-                    ]
-                else:
-                    stable = scored
-
-                # Select top positions from stable candidates; fall back to full ranking if needed
-                picks = [s for s, _ in stable[: cfg.positions]]
-                if len(picks) < cfg.positions:
-                    # Fallback: fill remaining slots from full ranked list (excluding already picked)
-                    picks_set = set(picks)
-                    for s, _ in scored:
-                        if len(picks) >= cfg.positions:
-                            break
-                        if s not in picks_set:
-                            picks.append(s)
-                            picks_set.add(s)
-
-                # Target equal weight among picks
-                target_weights = {s: 1.0 / len(picks) for s in picks} if picks else {}
-
-                # Compute current weights
-                pv = portfolio_value(dt)
-                current_values = {}
-                for sym, sh in holdings.items():
-                    px = closes[sym].loc[:dt].iloc[-1]
-                    current_values[sym] = sh * float(px)
-
-                # Determine trades to reach targets
-                # We’ll do "full rebalance": sell names not in picks, resize those in picks
-                target_values = {s: pv * target_portfolio_fraction * w for s, w in target_weights.items()}
-
-                # Sell removed
-                for sym in list(holdings.keys()):
-                    if sym not in target_values:
-                        traded_notional += abs(current_values.get(sym, 0.0))
-                        trades += 1
-                        del holdings[sym]
-
-                # Resize/add picks
-                for sym, tval in target_values.items():
-                    # price as of dt
-                    cs = closes.get(sym)
-                    if cs is None:
-                        continue
-                    px = cs.loc[:dt].iloc[-1]
-                    if not np.isfinite(px) or px <= 0:
-                        continue
-
-                    cur_val = current_values.get(sym, 0.0)
-                    diff = tval - cur_val
-
-                    # Apply threshold only to resize trades for symbols already held.
-                    # New entries should always be allowed; full exits are handled above.
-                    is_resize_trade = sym in current_values
-                    if is_resize_trade:
-                        current_weight = (cur_val / pv) if pv > 0 else 0.0
-                        target_weight = target_weights.get(sym, 0.0)
-                        weight_diff = abs(target_weight - current_weight)
-                        if weight_diff < cfg.min_rebalance_weight_change:
-                            continue
-
-                    if abs(diff) / max(pv, 1e-9) < 1e-4:
-                        continue
-
-                    # trade shares
-                    dsh = diff / float(px)
-                    holdings[sym] = holdings.get(sym, 0.0) + dsh
-                    traded_notional += abs(diff)
-                    trades += 1
-
-                # Transaction cost: broker commission / market impact
-                cost = traded_notional * (cfg.cost_bps / 10_000.0)
-                # Slippage: execution at worse prices for both buys and sells
-                slippage_cost = traded_notional * (cfg.slippage_bps / 10_000.0)
-                total_costs_dollar += cost + slippage_cost
-
-                cash = (
-                    pv
-                    - sum(
-                        holdings[s] * float(closes[s].loc[:dt].iloc[-1])
-                        for s in holdings
-                    )
-                    - cost
-                    - slippage_cost
+            if cfg.execution_price == "close":
+                decision = build_rebalance_decision(
+                    decision_date=dt,
+                    choppy_override=bool(_choppy_override),
+                    momentum_effectiveness=_momentum_effectiveness,
                 )
-
-                # Per-rebalance turnover = traded notional / portfolio value
-                rebal_to = traded_notional / pv if pv > 0 else 0.0
-                turnover_per_rebalance.append(rebal_to)
-                total_turnover += rebal_to
-
-            # Record rebalance-level diagnostics for reconciliation/debugging.
-            pv_after = portfolio_value(dt)
-            rebal_to = traded_notional / pv if pv > 0 else 0.0
-            rebalance_records.append(
-                {
-                    "rebalance_date": dt,
-                    "choppy_override": bool(_choppy_override),
-                    "skip_reason": "",
-                    "momentum_effectiveness": (
-                        float(_momentum_effectiveness)
-                        if _momentum_effectiveness is not None else np.nan
-                    ),
-                    "risk_on": bool(risk_on),
-                    "target_exposure": float(target_portfolio_fraction),
-                    "eligible_count": int(eligible_count),
-                    "selected_symbols": "|".join(picks),
-                    "turnover": float(rebal_to),
-                    "estimated_cost": float(cost),
-                    "estimated_slippage": float(slippage_cost),
-                    "equity_before_rebalance": float(pv),
-                    "equity_after_rebalance": float(pv_after),
-                }
-            )
+                execute_rebalance(decision)
+            else:
+                execution_date = _next_trading_date(cal, dt)
+                if execution_date is None:
+                    skipped_execution_rebalances += 1
+                    _pv_s = portfolio_value(dt)
+                    rebalance_records.append(
+                        {
+                            "rebalance_date": dt,
+                            "decision_date": dt,
+                            "execution_date": pd.NaT,
+                            "execution_price": cfg.execution_price,
+                            "skipped": True,
+                            "choppy_override": bool(_choppy_override),
+                            "skip_reason": "no_next_execution_day",
+                            "momentum_effectiveness": (
+                                float(_momentum_effectiveness)
+                                if _momentum_effectiveness is not None else np.nan
+                            ),
+                            "risk_on": bool(market_risk_on(market_df, dt, cfg)),
+                            "target_exposure": 0.0,
+                            "eligible_count": 0,
+                            "selected_symbols": "",
+                            "holdings_count_before": int(len(holdings)),
+                            "holdings_count_after": int(len(holdings)),
+                            "holdings_signature_before": holdings_signature_str(),
+                            "holdings_signature_after": holdings_signature_str(),
+                            "cash_before": float(cash),
+                            "cash_after": float(cash),
+                            "turnover": 0.0,
+                            "estimated_cost": 0.0,
+                            "estimated_slippage": 0.0,
+                            "equity_before_rebalance": float(_pv_s),
+                            "equity_after_rebalance": float(_pv_s),
+                            "skipped_execution_symbols": 0,
+                        }
+                    )
+                else:
+                    decision = build_rebalance_decision(
+                        decision_date=dt,
+                        choppy_override=bool(_choppy_override),
+                        momentum_effectiveness=_momentum_effectiveness,
+                    )
+                    decision["execution_date"] = execution_date
+                    pending_rebalance = decision
 
         # Record daily equity
         eq_s, invested_s, _ = portfolio_state(dt)
@@ -905,6 +1195,9 @@ def run_weekly_portfolio(
         ending_cash=float(cash),
         ending_holdings={s: float(sh) for s, sh in holdings.items()},
         non_zero_exposure_days=int(non_zero_exposure_days),
+        gap_records=(gap_records if cfg.execution_price == "next_open" else []),
+        skipped_execution_symbols=int(skipped_execution_symbols),
+        skipped_execution_rebalances=int(skipped_execution_rebalances),
     )
 
 
@@ -970,6 +1263,9 @@ def walk_forward_validate(
     all_rebalance_dates: List[pd.Timestamp] = []
     total_selected_symbols_across_rebalances = 0
     total_non_zero_exposure_days = 0
+    all_gap_records: List[Dict[str, object]] = []
+    total_skipped_execution_symbols = 0
+    total_skipped_execution_rebalances = 0
 
     cash = cfg.starting_cash
     holdings: Dict[str, float] = {}
@@ -994,6 +1290,8 @@ def walk_forward_validate(
             "window_end": we,
             "trades": res.trades,
             "turnover": res.turnover,
+            "skipped_execution_symbols": res.skipped_execution_symbols,
+            "skipped_execution_rebalances": res.skipped_execution_rebalances,
             **res.metrics,
         }
         results.append(row)
@@ -1007,6 +1305,9 @@ def walk_forward_validate(
             if str(r.get("selected_symbols", "")).strip() != ""
         )
         total_non_zero_exposure_days += int(res.non_zero_exposure_days)
+        all_gap_records.extend(res.gap_records)
+        total_skipped_execution_symbols += int(res.skipped_execution_symbols)
+        total_skipped_execution_rebalances += int(res.skipped_execution_rebalances)
 
         # stitch equity curve
         eq = res.equity_curve
@@ -1035,6 +1336,9 @@ def walk_forward_validate(
         "total_trades": int(results_df["trades"].sum()) if "trades" in results_df.columns else 0,
         "total_selected_symbols_across_rebalances": int(total_selected_symbols_across_rebalances),
         "non_zero_exposure_days": int(total_non_zero_exposure_days),
+        "skipped_execution_symbols": int(total_skipped_execution_symbols),
+        "skipped_execution_rebalances": int(total_skipped_execution_rebalances),
+        "gap_records": all_gap_records,
     }
 
     return results_df, combined_equity, debug_info

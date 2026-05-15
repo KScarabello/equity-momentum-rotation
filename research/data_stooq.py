@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import pandas as pd
 
@@ -23,6 +23,63 @@ def list_stooq_parquets(
 def _infer_symbol_from_filename(p: Path) -> str:
     name = p.stem
     return name.split(".")[0] if "." in name else name
+
+
+def normalize_stooq_ohlcv(
+    df: pd.DataFrame,
+    require_columns: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    if "date" in df.columns:
+        df = df.set_index(pd.to_datetime(df["date"])).drop(columns=["date"])
+    elif "Date" in df.columns:
+        df = df.set_index(pd.to_datetime(df["Date"])).drop(columns=["Date"])
+    else:
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index)
+
+    df = df.sort_index()
+    df = df.rename(columns={c: str(c).strip().lower() for c in df.columns})
+
+    for alias in ["adj close", "adjclose", "adj_close"]:
+        if alias in df.columns and "close" not in df.columns:
+            df = df.rename(columns={alias: "close"})
+
+    if require_columns is not None:
+        missing = [col for col in require_columns if col not in df.columns]
+        if missing:
+            raise ValueError(f"Missing required columns {missing}. Have: {list(df.columns)}")
+
+    return df.copy()
+
+
+def load_stooq_ohlcv_bundle(
+    stooq_dir: Union[str, Path] = "data_cache/stooq",
+    limit_symbols: Optional[int] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    require_open: bool = False,
+) -> Dict[str, pd.DataFrame]:
+    files = list_stooq_parquets(stooq_dir, limit=limit_symbols)
+    required = ["close", "volume"]
+    if require_open:
+        required.insert(0, "open")
+
+    symbol_dfs: Dict[str, pd.DataFrame] = {}
+    for fp in files:
+        sym = _infer_symbol_from_filename(fp)
+        df = normalize_stooq_ohlcv(pd.read_parquet(fp), require_columns=required)
+
+        if start:
+            df = df.loc[pd.to_datetime(start) :]
+        if end:
+            df = df.loc[: pd.to_datetime(end)]
+
+        symbol_dfs[sym] = df
+
+    if not symbol_dfs:
+        raise ValueError("No usable OHLCV series found.")
+
+    return symbol_dfs
 
 
 def load_stooq_price_matrix(

@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from config.live_trading_config import LiveTradingConfig, build_baseline_cfg, load_live_trading_config
-from live.alpaca_client import AlpacaBroker, AlpacaCredentials, AlpacaDependencyError
+from live.alpaca_client import AlpacaBroker, AlpacaCredentials, AlpacaDependencyError, round_alpaca_limit_price
 from live.execution_gate import (
     filter_symbols_already_pending,
     validate_account_for_trading,
@@ -261,7 +261,8 @@ def _submit_orders(
     for idx, row in enumerate(orders_rows, start=1):
         symbol = str(row["symbol"]).upper()
         side = str(row["side"]).lower()
-        limit_price = float(row["limit_price"])
+        raw_limit_price = float(row["limit_price"])
+        limit_price = round_alpaca_limit_price(raw_limit_price)
         reason = str(row.get("reason", ""))
         cid = f"mom-{run_id}-{idx}"
 
@@ -275,6 +276,7 @@ def _submit_orders(
                     "submit_buy_notional",
                     symbol=symbol,
                     notional=notional,
+                    raw_limit_price=raw_limit_price,
                     limit_price=limit_price,
                     client_order_id=cid,
                     reason=reason,
@@ -295,6 +297,7 @@ def _submit_orders(
                     "submit_sell_qty",
                     symbol=symbol,
                     qty=qty,
+                    raw_limit_price=raw_limit_price,
                     limit_price=limit_price,
                     client_order_id=cid,
                     reason=reason,
@@ -327,6 +330,8 @@ def _submit_orders(
                     "order_id": order_id,
                     "status": status,
                     "client_order_id": cid,
+                    "raw_limit_price": raw_limit_price,
+                    "limit_price": limit_price,
                     "filled_qty": filled_qty,
                     "filled_avg_price": filled_avg_price,
                     "error": "",
@@ -340,12 +345,22 @@ def _submit_orders(
                     "order_id": "",
                     "status": "submit_error",
                     "client_order_id": cid,
+                    "raw_limit_price": raw_limit_price,
+                    "limit_price": limit_price,
                     "filled_qty": 0.0,
                     "filled_avg_price": 0.0,
                     "error": str(exc),
                 }
             )
-            _log_event(logger, "order_submit_error", symbol=symbol, side=side, error=str(exc))
+            _log_event(
+                logger,
+                "order_submit_error",
+                symbol=symbol,
+                side=side,
+                raw_limit_price=raw_limit_price,
+                limit_price=limit_price,
+                error=str(exc),
+            )
 
         time.sleep(0.25)
 
